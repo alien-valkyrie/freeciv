@@ -285,13 +285,13 @@ ADD_CAP_PATTERN = re.compile(r"^add-cap\((.*)\)$")
 # matches a remove-cap flag (optional capability)
 REMOVE_CAP_PATTERN = re.compile(r"^remove-cap\((.*)\)$")
 
-# Parses a line of the form "COORD x, y; key" and returns a list of
+# Parses a line of the form "COORD x, y; key" and yields
 # Field objects. types is a dict mapping type aliases to their meaning
-def parse_fields(line: str, types: typing.Mapping[str, str]) -> "list[Field]":
+def parse_fields(line: str, types: typing.Mapping[str, str]) -> "typing.Iterable[Field]":
     mo = FIELDS_LINE_PATTERN.fullmatch(line)
     if mo is None:
         raise ValueError("invalid field definition: %r" % line)
-    type_text, fields_, flags = (i.strip() for i in mo.groups(""))
+    type_text, fields, flags = (i.strip() for i in mo.groups(""))
 
     # analyze type
     # FIXME: no infinite loop detection
@@ -310,40 +310,6 @@ def parse_fields(line: str, types: typing.Mapping[str, str]) -> "list[Field]":
             raise ValueError("float type without float factor: %r" % type_text)
         typeinfo["dataio_type"]=mo.group(1)
         typeinfo["float_factor"]=int(mo.group(2))
-
-    # analyze fields
-    fields=[]
-    for i in fields_.split(","):
-        i=i.strip()
-        t={}
-
-        def f(x):
-            arr=x.split(":")
-            if len(arr)==1:
-                return [x,x,x]
-            elif len(arr) == 2:
-                arr.append("old->"+arr[1])
-                arr[1]="real_packet->"+arr[1]
-                return arr
-            else:
-                raise ValueError("Invalid array size declaration: %r" % x)
-
-        mo = ARRAY_2D_PATTERN.fullmatch(i)
-        if mo:
-            t["name"]=mo.group(1)
-            t["is_array"]=2
-            t["array_size1_d"],t["array_size1_u"],t["array_size1_o"]=f(mo.group(2))
-            t["array_size2_d"],t["array_size2_u"],t["array_size2_o"]=f(mo.group(3))
-        else:
-            mo = ARRAY_1D_PATTERN.fullmatch(i)
-            if mo:
-                t["name"]=mo.group(1)
-                t["is_array"]=1
-                t["array_size_d"],t["array_size_u"],t["array_size_o"]=f(mo.group(2))
-            else:
-                t["name"]=i
-                t["is_array"]=0
-        fields.append(t)
 
     # analyze flags
     flaginfo={}
@@ -386,7 +352,39 @@ def parse_fields(line: str, types: typing.Mapping[str, str]) -> "list[Field]":
     else:
         flaginfo["remove_cap"]=""
 
-    return [Field(fieldinfo, typeinfo, flaginfo) for fieldinfo in fields]
+    # analyze fields
+    for i in fields.split(","):
+        i=i.strip()
+        fieldinfo={}
+
+        def f(x):
+            arr=x.split(":")
+            if len(arr)==1:
+                return [x,x,x]
+            elif len(arr) == 2:
+                arr.append("old->"+arr[1])
+                arr[1]="real_packet->"+arr[1]
+                return arr
+            else:
+                raise ValueError("Invalid array size declaration: %r" % x)
+
+        mo = ARRAY_2D_PATTERN.fullmatch(i)
+        if mo:
+            fieldinfo["name"]=mo.group(1)
+            fieldinfo["is_array"]=2
+            fieldinfo["array_size1_d"],fieldinfo["array_size1_u"],fieldinfo["array_size1_o"]=f(mo.group(2))
+            fieldinfo["array_size2_d"],fieldinfo["array_size2_u"],fieldinfo["array_size2_o"]=f(mo.group(3))
+        else:
+            mo = ARRAY_1D_PATTERN.fullmatch(i)
+            if mo:
+                fieldinfo["name"]=mo.group(1)
+                fieldinfo["is_array"]=1
+                fieldinfo["array_size_d"],fieldinfo["array_size_u"],fieldinfo["array_size_o"]=f(mo.group(2))
+            else:
+                fieldinfo["name"]=i
+                fieldinfo["is_array"]=0
+
+        yield Field(fieldinfo, typeinfo, flaginfo)
 
 # Class for a field (part of a packet). It has a name, serveral types,
 # flags and some other attributes.
