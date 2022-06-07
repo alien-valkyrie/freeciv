@@ -22,9 +22,29 @@ from pathlib import Path
 from contextlib import contextmanager
 from functools import partial
 from itertools import chain, combinations
+from abc import ABC, abstractmethod
 
 import typing
 T_co = typing.TypeVar("T_co", covariant = True)
+
+try:
+    from functools import cached_property
+except ImportError:
+    class cached_property:
+        """Simplified backport of Python 3.8's functools.cached_property
+        with fewer checks and safeguards. Not thread-safe."""
+
+        def __init__(self, func):
+            self.func = func
+
+        def __get__(self, instance, owner=None):
+            if instance is None:
+                return self
+            d = instance.__dict__
+            name = self.func.__name__
+            if name not in d:
+                d[name] = self.func(instance)
+            return d[name]
 
 
 ###################### Parsing Command Line Arguments ######################
@@ -255,6 +275,7 @@ def lazy_overwrite_open(path: "str | Path", suffix: str = ".tmp") -> typing.Iter
         tmp_path.unlink()
     else:
         verbose("lazy: content changed, replacing...")
+        raise RuntimeError("IT CHANGED!")
         tmp_path.replace(path)
 
 ######################### General helper functions #########################
@@ -270,153 +291,334 @@ def prefix(prefix: str, text: str) -> str:
     return "\n".join(prefix + line for line in text.split("\n"))
 
 
+############################ Field type classes ############################
+
+class ArraySize:
+    """Information about the size of an array dimension"""
+
+    def __init__(self, max_length: str, actual_length: "str | None" = None):
+        self.max_length = max_length
+        self._actual_length = actual_length
+
+    @property
+    def real(self) -> str:
+        if self._actual_length is None:
+            return self.max_length
+        return "real_packet->" + self._actual_length
+
+    @property
+    def old(self) -> str:
+        if self._actual_length is None:
+            return self.max_length
+        return "old->" + self._actual_length
+
+    @classmethod
+    def parse(cls, size_text: str) -> "ArraySize":
+        parts = size_text.split(":")
+        if len(parts) > 2:
+            raise ValueError("Invalid array size declaration: %r" % size_text)
+        return cls(*size_text.split(":"))
+
+
+class FieldType(ABC):
+    """Abstract base class (ABC) for different field types"""
+
+    # matches a field type (dataio type and struct/public type)
+    TYPE_INFO_PATTERN = re.compile(r"^(.*)\((.*)\)$")
+    # matches a dataio type with float factor
+    FLOAT_FACTOR_PATTERN = re.compile(r"^(\D+)(\d+)$")
+
+    @staticmethod
+    def parse(type_text: str) -> "FieldType":
+        mo = __class__.TYPE_INFO_PATTERN.fullmatch(type_text)
+        if mo is None:
+            raise ValueError("malformed or undefined type: %r" % type_text)
+        dataio_type, public_type = mo.groups()
+
+        if public_type == "float":
+            mo = __class__.FLOAT_FACTOR_PATTERN.fullmatch(dataio_type)
+            if mo is None:
+                raise ValueError("float type without float factor: %r" % type_text)
+            dataio_type = mo.group(1)
+            float_factor = int(mo.group(2))
+            return FloatType(dataio_type, public_type, float_factor)
+        else:
+            return BasicType(dataio_type, public_type)
+
+    array_sizes = ()
+
+    @abstractmethod
+    def __init__(self):
+        self.dataio_type = str()
+        self.public_type = str()
+        self.float_factor = int()
+
+    def array(self, size: ArraySize) -> "FieldType":
+        return ArrayType(self, size)
+
+class BasicType(FieldType):
+    def __init__(self, dataio_type: str, public_type: str):
+        self.dataio_type = dataio_type
+        self.public_type = public_type
+
+    @property
+    def float_factor(self):
+        raise AttributeError("non-float field type has no float factor")
+
+class FloatType(FieldType):
+    def __init__(self, dataio_type: str, public_type: str, float_factor: int):
+        self.dataio_type = dataio_type
+        self.public_type = public_type
+        self.float_factor = float_factor
+
+class ArrayType(FieldType):
+    def __init__(self, element_type: FieldType, size: ArraySize):
+        self.element_type = element_type
+        self.size = size
+
+    @property
+    def dataio_type(self) -> str:
+        return self.element_type.dataio_type
+
+    @property
+    def public_type(self) -> str:
+        return self.element_type.public_type
+
+    @property
+    def float_factor(self) -> int:
+        return self.element_type.float_factor
+
+    @cached_property
+    def array_sizes(self) -> "tuple[ArraySize]":
+        return (self.size,) + self.element_type.array_sizes
+
+
+class FieldFlagInfo:
+    """Flag info for a field in a packet. Multiple fields declared on the
+    same line will share the same flag info object."""
+
+    # matches an add-cap flag (optional capability)
+    ADD_CAP_PATTERN = re.compile(r"^add-cap\((.*)\)$")
+    # matches a remove-cap flag (optional capability)
+    REMOVE_CAP_PATTERN = re.compile(r"^remove-cap\((.*)\)$")
+
+    @classmethod
+    def parse(cls, text: str) -> "FieldFlagInfo":
+        return cls(
+            stripped
+            for flag in text.split(",")
+            for stripped in (flag.strip(),)
+            if stripped
+        )
+
+    def __init__(self, flags: typing.Iterable[str]):
+        flags = set(flags)
+
+        self.is_key = "key" in flags
+        flags.discard("key")
+
+        self.diff = "diff" in flags
+        flags.discard("diff")
+
+        adds=[]
+        removes=[]
+        remaining = set()
+        for flag_text in flags:
+            mo = __class__.ADD_CAP_PATTERN.fullmatch(flag_text)
+            if mo:
+                adds.append(mo.group(1))
+                continue
+            mo = __class__.REMOVE_CAP_PATTERN.fullmatch(flag_text)
+            if mo:
+                removes.append(mo.group(1))
+                continue
+            remaining.add(flag_text)
+
+        self.add_caps = frozenset(adds)
+        self.remove_caps = frozenset(removes)
+
+        if remaining:
+            raise ValueError("unrecognized flags in field declaration: %s" % " ".join(remaining))
+
+        # sanity check
+        double_caps = self.add_caps & self.remove_caps
+        if double_caps:
+            raise ValueError("same capabilities as both add-cap and remove-cap: %s" % " ".join(double_caps))
+
+
 # matches an entire field definition line (type, fields and flag info)
 FIELDS_LINE_PATTERN = re.compile(r"^\s*(\S+(?:\(.*\))?)\s+([^;()]*)\s*;\s*(.*)\s*$")
-# matches a field type (dataio type and struct/public type)
-TYPE_INFO_PATTERN = re.compile(r"^(.*)\((.*)\)$")
-# matches a dataio type with float factor
-FLOAT_FACTOR_PATTERN = re.compile(r"^(\D+)(\d+)$")
-# matches a 2D-array field definition (name, first array size, second array size)
-ARRAY_2D_PATTERN = re.compile(r"^(.*)\[(.*)\]\[(.*)\]$")
-# matches a 1D-array field definition (name, array size)
-ARRAY_1D_PATTERN = re.compile(r"^(.*)\[(.*)\]$")
-# matches an add-cap flag (optional capability)
-ADD_CAP_PATTERN = re.compile(r"^add-cap\((.*)\)$")
-# matches a remove-cap flag (optional capability)
-REMOVE_CAP_PATTERN = re.compile(r"^remove-cap\((.*)\)$")
+# matches any field definition with an array size at the end
+ARRAY_PATTERN = re.compile(r"^(.*)\[([^][]*)\]$")
 
 # Parses a line of the form "COORD x, y; key" and yields
 # Field objects. types is a dict mapping type aliases to their meaning
-def parse_fields(line: str, types: typing.Mapping[str, str]) -> "typing.Iterable[Field]":
+def parse_fields(line: str, types: typing.MutableMapping[str, FieldType]) -> "typing.Iterable[Field]":
     mo = FIELDS_LINE_PATTERN.fullmatch(line)
     if mo is None:
         raise ValueError("invalid field definition: %r" % line)
     type_text, fields, flags = (i.strip() for i in mo.groups(""))
 
     # analyze type
-    # FIXME: no infinite loop detection
-    while type_text in types:
-        type_text = types[type_text]
+    if type_text not in types:
+        types[type_text] = FieldType.parse(type_text)
+    typeinfo = types[type_text]
 
-    typeinfo={}
-    mo = TYPE_INFO_PATTERN.fullmatch(type_text)
-    if mo is None:
-        raise ValueError("malformed or undefined type: %r" % type_text)
-    typeinfo["dataio_type"],typeinfo["struct_type"]=mo.groups()
-
-    if typeinfo["struct_type"]=="float":
-        mo = FLOAT_FACTOR_PATTERN.fullmatch(typeinfo["dataio_type"])
-        if mo is None:
-            raise ValueError("float type without float factor: %r" % type_text)
-        typeinfo["dataio_type"]=mo.group(1)
-        typeinfo["float_factor"]=int(mo.group(2))
-
-    # analyze flags
-    flaginfo={}
-    arr = [
-        stripped
-        for flag in flags.split(",")
-        for stripped in (flag.strip(),)
-        if stripped
-    ]
-    flaginfo["is_key"]=("key" in arr)
-    if flaginfo["is_key"]: arr.remove("key")
-    flaginfo["diff"]=("diff" in arr)
-    if flaginfo["diff"]: arr.remove("diff")
-    adds=[]
-    removes=[]
-    remaining=[]
-    for i in arr:
-        mo = ADD_CAP_PATTERN.fullmatch(i)
-        if mo:
-            adds.append(mo.group(1))
-            continue
-        mo = REMOVE_CAP_PATTERN.fullmatch(i)
-        if mo:
-            removes.append(mo.group(1))
-            continue
-        remaining.append(i)
-    if len(adds) + len(removes) > 1:
-        raise ValueError("A field can only have one add-cap or remove-cap: %s" % line)
-
-    if remaining:
-        raise ValueError("unrecognized flags in field declaration: %s" % " ".join(remaining))
-
-    if adds:
-        flaginfo["add_cap"]=adds[0]
-    else:
-        flaginfo["add_cap"]=""
-
-    if removes:
-        flaginfo["remove_cap"]=removes[0]
-    else:
-        flaginfo["remove_cap"]=""
+    flaginfo = FieldFlagInfo.parse(flags)
 
     # analyze fields
-    for i in fields.split(","):
-        i=i.strip()
-        fieldinfo={}
+    for field_text in fields.split(","):
+        field_text = field_text.strip()
+        field_type = typeinfo
 
-        def f(x):
-            arr=x.split(":")
-            if len(arr)==1:
-                return [x,x,x]
-            elif len(arr) == 2:
-                arr.append("old->"+arr[1])
-                arr[1]="real_packet->"+arr[1]
-                return arr
-            else:
-                raise ValueError("Invalid array size declaration: %r" % x)
+        # successively parse array dimensions *from right to left*
+        ## while (mo := ARRAY_PATTERN.fullmatch(field_text)) is not None:
+        mo = ARRAY_PATTERN.fullmatch(field_text)
+        while mo is not None:
+            field_text = mo.group(1)
+            field_type = field_type.array(ArraySize.parse(mo.group(2)))
+            mo = ARRAY_PATTERN.fullmatch(field_text)
 
-        mo = ARRAY_2D_PATTERN.fullmatch(i)
-        if mo:
-            fieldinfo["name"]=mo.group(1)
-            fieldinfo["is_array"]=2
-            fieldinfo["array_size1_d"],fieldinfo["array_size1_u"],fieldinfo["array_size1_o"]=f(mo.group(2))
-            fieldinfo["array_size2_d"],fieldinfo["array_size2_u"],fieldinfo["array_size2_o"]=f(mo.group(3))
-        else:
-            mo = ARRAY_1D_PATTERN.fullmatch(i)
-            if mo:
-                fieldinfo["name"]=mo.group(1)
-                fieldinfo["is_array"]=1
-                fieldinfo["array_size_d"],fieldinfo["array_size_u"],fieldinfo["array_size_o"]=f(mo.group(2))
-            else:
-                fieldinfo["name"]=i
-                fieldinfo["is_array"]=0
-
-        yield Field(fieldinfo, typeinfo, flaginfo)
+        yield Field(field_text, field_type, flaginfo)
 
 # Class for a field (part of a packet). It has a name, serveral types,
 # flags and some other attributes.
 class Field:
-    def __init__(self, fieldinfo: typing.Mapping, typeinfo: typing.Mapping, flaginfo: typing.Mapping):
-        self.name = fieldinfo["name"]
-        self.is_array = fieldinfo["is_array"]
-        if self.is_array == 2:
-            self.array_size1_d = fieldinfo["array_size1_d"]
-            self.array_size1_u = fieldinfo["array_size1_u"]
-            self.array_size1_o = fieldinfo["array_size1_o"]
-            self.array_size2_d = fieldinfo["array_size2_d"]
-            self.array_size2_u = fieldinfo["array_size2_u"]
-            self.array_size2_o = fieldinfo["array_size2_o"]
-        elif self.is_array == 1:
-            self.array_size_d = fieldinfo["array_size_d"]
-            self.array_size_u = fieldinfo["array_size_u"]
-            self.array_size_o = fieldinfo["array_size_o"]
+    def __init__(self, name: str, typeinfo: FieldType, flaginfo: FieldFlagInfo):
+        self.name = name
+        self.type = typeinfo
+        self.flags = flaginfo
 
-        self.dataio_type = typeinfo["dataio_type"]
-        self.struct_type = typeinfo["struct_type"]
-        self.float_factor = typeinfo.get("float_factor")
+    @property
+    def array_info(self) -> "tuple[ArraySize, ...]":
+        return self.type.array_sizes
 
-        self.is_key = flaginfo["is_key"]
-        self.diff = flaginfo["diff"]
-        self.add_cap = flaginfo["add_cap"]
-        self.remove_cap = flaginfo["remove_cap"]
+    @property
+    def is_array(self) -> int:
+        """Number of array dimensions"""
+        return len(self.array_info)
+
+    @property
+    def _array_size(self) -> ArraySize:
+        """Array size information of the only array dimension"""
+        assert self.is_array == 1
+        return self.array_info[0]
+
+    @property
+    def array_size_d(self) -> str:
+        """Maximum / declared size of the only array dimension"""
+        return self._array_size.max_length
+
+    @property
+    def array_size_u(self) -> str:
+        """Current actual size of the only array dimension"""
+        return self._array_size.real
+
+    @property
+    def array_size_o(self) -> str:
+        """Old actual size of the only array dimension"""
+        return self._array_size.old
+
+    @property
+    def _array_size1(self) -> ArraySize:
+        """Array size information of the first of two array dimensions"""
+        assert self.is_array == 2
+        return self.array_info[0]
+
+    @property
+    def array_size1_d(self) -> str:
+        """Maximum / declared size of the first of two array dimensions"""
+        return self._array_size1.max_length
+
+    @property
+    def array_size1_u(self) -> str:
+        """Current actual size of the first of two array dimensions"""
+        return self._array_size1.real
+
+    @property
+    def array_size1_o(self) -> str:
+        """Old actual size of the first of two array dimensions"""
+        return self._array_size1.old
+
+    @property
+    def _array_size2(self) -> ArraySize:
+        """Array size information of the second of two array dimensions"""
+        assert self.is_array == 2
+        return self.array_info[1]
+
+    @property
+    def array_size2_d(self) -> str:
+        """Maximum / declared size of the second of two array dimensions"""
+        return self._array_size2.max_length
+
+    @property
+    def array_size2_u(self) -> str:
+        """Current actual size of the second of two array dimensions"""
+        return self._array_size2.real
+
+    @property
+    def array_size2_o(self) -> str:
+        """Old actual size of the second of two array dimensions"""
+        return self._array_size2.old
+
+    @property
+    def dataio_type(self) -> str:
+        """The type used to transmit this field
+
+        See FieldType.dataio_type"""
+        return self.type.dataio_type
+
+    @property
+    def struct_type(self) -> str:
+        """The type used for this field in the packet struct
+
+        See FieldType.struct_type"""
+        return self.type.public_type
+
+    @property
+    def float_factor(self) -> int:
+        """The float factor, if this field is a float
+
+        See FieldType.float_factor"""
+        return self.type.float_factor
 
     @property
     def is_struct(self) -> bool:
         """Whether the base type of this field is a struct"""
         return self.struct_type.startswith("struct")
+
+    @property
+    def is_key(self) -> bool:
+        """Whether this is a key field"""
+        return self.flags.is_key
+
+    @property
+    def diff(self) -> bool:
+        """Whether this field should use array-diff"""
+        return self.flags.diff
+
+    @property
+    def add_caps(self) -> typing.AbstractSet[str]:
+        """Set of all required capabilities for this field"""
+        return self.flags.add_caps
+
+    @property
+    def remove_caps(self) -> typing.AbstractSet[str]:
+        """Set of all forbidden capabilities for this field"""
+        return self.flags.remove_caps
+
+    @property
+    def caps(self) -> typing.AbstractSet[str]:
+        """All capabilities affecting this field"""
+        return self.add_caps | self.remove_caps
+
+    def present_with_capabilities(self, caps: typing.Container[str]) -> bool:
+        """Determine whether this field should be part of a variant with the
+        given capabilities"""
+        return (
+            all(cap in caps for cap in self.add_caps)
+            and all (cap not in caps for cap in self.remove_caps)
+        )
 
     def get_handle_type(self) -> str:
         if self.dataio_type=="string" or self.dataio_type=="estring":
@@ -552,26 +754,31 @@ class Field:
     # Returns a code fragment which will put this field if the
     # content has changed. Does nothing for bools-in-header.
     def get_put_wrapper(self, packet: "Variant", i: int, deltafragment: bool) -> str:
-        if fold_bool_into_header and self.struct_type=="bool" and \
-           not self.is_array:
+        if self.folded_into_head:
             return "  /* field {i:d} is folded into the header */\n".format(i = i)
         put=self.get_put(deltafragment)
         if packet.gen_log:
-            f = '    {packet.log_macro}("  field \'{self.name}\' has changed");\n'.format(packet = packet, self = self)
+            f = """\
+    {packet.log_macro}("  field '{self.name}' has changed");
+""".format(packet = packet, self = self)
         else:
             f=""
         if packet.gen_stats:
-            s = "    stats_{packet.name}_counters[{i:d}]++;\n".format(packet = packet, i = i)
+            s = """\
+    stats_{packet.name}_counters[{i:d}]++;
+""".format(packet = packet, i = i)
         else:
             s=""
-        return """  if (BV_ISSET(fields, {i:d})) {{
+        return """\
+  if (BV_ISSET(fields, {i:d})) {{
 {f}{s}  {put}
   }}
 """.format(i = i, f = f, s = s, put = put)
 
     # Returns code which put this field.
     def get_put(self, deltafragment: bool) -> str:
-        return """#ifdef FREECIV_JSON_CONNECTION
+        return """\
+#ifdef FREECIV_JSON_CONNECTION
   field_addr.name = \"{self.name}\";
 #endif /* FREECIV_JSON_CONNECTION */
 """.format(self = self) \
@@ -771,11 +978,9 @@ class Field:
     # Returns a code fragment which will get the field if the
     # "fields" bitvector says so.
     def get_get_wrapper(self, packet: "Variant", i: int, deltafragment: bool) -> str:
-        get=self.get_get(deltafragment)
-        if fold_bool_into_header and self.struct_type=="bool" and \
-           not self.is_array:
+        if self.folded_into_head:
             return  "  real_packet->{self.name} = BV_ISSET(fields, {i:d});\n".format(self = self, i = i)
-        get=prefix("    ",get)
+        get = prefix("    ", self.get_get(deltafragment))
         if packet.gen_log:
             f = "    {packet.log_macro}(\"  got field '{self.name}'\");\n".format(self = self, packet = packet)
         else:
@@ -787,7 +992,8 @@ class Field:
 
     # Returns code which get this field.
     def get_get(self, deltafragment: bool) -> str:
-        return """#ifdef FREECIV_JSON_CONNECTION
+        return """\
+#ifdef FREECIV_JSON_CONNECTION
 field_addr.name = \"{self.name}\";
 #endif /* FREECIV_JSON_CONNECTION */
 """.format(self = self) \
@@ -796,29 +1002,35 @@ field_addr.name = \"{self.name}\";
     # The code which get this field before it is wrapped in address adding.
     def get_get_real(self, deltafragment: bool) -> str:
         if self.struct_type=="float" and not self.is_array:
-            return """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}, {self.float_factor:d})) {{
+            return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}, {self.float_factor:d})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
         if self.dataio_type=="bitvector":
-            return """if (!DIO_BV_GET(&din, &field_addr, real_packet->{self.name})) {{
+            return """\
+if (!DIO_BV_GET(&din, &field_addr, real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
         if self.dataio_type in ["string","estring","city_map"] and \
            self.is_array!=2:
-            return """if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}, sizeof(real_packet->{self.name}))) {{
+            return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}, sizeof(real_packet->{self.name}))) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
         if self.is_struct and self.is_array==0:
-            return """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
+            return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
         if not self.is_array:
             if self.struct_type in ["int","bool"]:
-                return """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
+                return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
             else:
-                return """{{
+                return """\
+{{
   int readin;
 
   if (!DIO_GET({self.dataio_type}, &din, &field_addr, &readin)) {{
@@ -1037,17 +1249,21 @@ field_addr.sub_location = NULL;
 # Class which represents a capability variant.
 class Variant:
     def __init__(self, poscaps: typing.Iterable[str], negcaps: typing.Iterable[str],
-                       name: str, fields: typing.Sequence[Field], packet: "Packet", no: int):
+                       packet: "Packet", no: int):
         self.log_macro=use_log_macro
         self.gen_stats=generate_stats
         self.gen_log=generate_logs
-        self.name=name
+        self.name = "%s_%d" % (packet.name, no)
         self.packet = packet
-        self.fields=fields
         self.no=no
 
         self.poscaps = set(poscaps)
         self.negcaps = set(negcaps)
+        self.fields = [
+            field
+            for field in packet.fields
+            if field.present_with_capabilities(self.poscaps)
+        ]
         self.key_fields = [field for field in self.fields if field.is_key]
         self.other_fields = [field for field in self.fields if not field.is_key]
         self.keys_format=", ".join(["%d"]*len(self.key_fields))
@@ -1624,7 +1840,7 @@ class Packet:
     # matches a packet cancel flag (cancelled packet type)
     CANCEL_PATTERN = re.compile(r"^cancel\((.*)\)$")
 
-    def __init__(self, text: str, types: typing.Mapping[str, str]):
+    def __init__(self, text: str, types: typing.MutableMapping[str, FieldType]):
         text = text.strip()
         lines = text.split("\n")
 
@@ -1699,7 +1915,6 @@ class Packet:
         if self.want_force: arr.remove("force")
 
         self.cancel=[]
-        removes=[]
         remaining=[]
         for i in arr:
             mo = __class__.CANCEL_PATTERN.fullmatch(i)
@@ -1731,19 +1946,10 @@ class Packet:
 
         # create cap variants
         all_caps = self.all_caps    # valid, since self.fields is already set
-        self.variants=[]
-        for i, poscaps in enumerate(powerset(sorted(all_caps))):
-            negcaps = all_caps.difference(poscaps)
-            fields = [
-                field
-                for field in self.fields
-                if (not field.add_cap and not field.remove_cap)
-                or (field.add_cap and field.add_cap in poscaps)
-                or (field.remove_cap and field.remove_cap in negcaps)
-            ]
-            no=i+100
-
-            self.variants.append(Variant(poscaps,negcaps,"%s_%d"%(self.name,no),fields,self,no))
+        self.variants = [
+            Variant(poscaps, all_caps.difference(poscaps), self, i + 100)
+            for i, poscaps in enumerate(powerset(sorted(all_caps)))
+        ]
 
     @property
     def name(self) -> str:
@@ -1807,8 +2013,7 @@ class Packet:
     @property
     def all_caps(self) -> "set[str]":
         """Set of all capabilities affecting this packet"""
-        return ({f.add_cap for f in self.fields if f.add_cap}
-                | {f.remove_cap for f in self.fields if f.remove_cap})
+        return set().union(*(f.caps for f in self.fields))
 
 
     # Returns a code fragment which contains the struct for this packet.
@@ -2238,7 +2443,7 @@ def packets_def_lines(def_text: str) -> typing.Iterator[str]:
     text = COMMENT_PATTERN.sub("", def_text)
     return filter(None, map(str.strip, text.split("\n")))
 
-def parse_packets_def(def_text: str) -> "list[Packet]":
+def parse_packets_def(def_text: str) -> typing.Iterable[Packet]:
     """Parse the given string as contents of packets.def"""
 
     # parse type alias definitions
@@ -2253,24 +2458,16 @@ def parse_packets_def(def_text: str) -> "list[Packet]":
         alias = mo.group("alias")
         dest = mo.group("dest")
         if alias in types:
-            if dest == types[alias]:
-                verbose("duplicate typedef: %r = %r" % (alias, dest))
-                continue
-            else:
-                raise ValueError("duplicate type alias %r: %r and %r"
-                                    % (alias, types[alias], dest))
-        types[alias] = dest
+            raise ValueError("duplicate type alias %r" % alias)
+        if dest not in types:
+            types[dest] = FieldType.parse(dest)
+        types[alias] = types[dest]
 
     # parse packet definitions
-    packets=[]
     for packet_text in PACKET_SEP_PATTERN.split("\n".join(packets_lines)):
         packet_text = packet_text.strip()
         if packet_text:
-            packets.append(Packet(packet_text, types))
-
-    # Note: only the packets are returned, as the type aliases
-    # are not needed any further
-    return packets
+            yield Packet(packet_text, types)
 
 
 ########################### Writing output files ###########################
@@ -2569,7 +2766,7 @@ def main(raw_args: "typing.Sequence[str] | None" = None):
     input_path = src_dir / "networking" / "packets.def"
 
     def_text = read_text(input_path, allow_missing = False)
-    packets = parse_packets_def(def_text)
+    packets = list(parse_packets_def(def_text))
     ### parsing finished
 
     write_common_header(script_args.common_header_path, packets)
