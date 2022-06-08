@@ -312,6 +312,12 @@ class ArraySize:
             return self.max_length
         return "old->" + self._actual_length
 
+    def __str__(self) -> str:
+        if self._actual_length is None:
+            return self.max_length
+        else:
+            return "%s:%s" % (self.max_length, self._actual_length)
+
     @classmethod
     def parse(cls, size_text: str) -> "ArraySize":
         parts = size_text.split(":")
@@ -320,8 +326,9 @@ class ArraySize:
         return cls(*size_text.split(":"))
 
 
-class FieldType(ABC):
-    """Abstract base class (ABC) for different field types"""
+class PreType(ABC):
+    """Abstract base class (ABC) for field types, as well as types that
+    require the addition of an array size to become useable field types."""
 
     # matches a field type (dataio type and struct/public type)
     TYPE_INFO_PATTERN = re.compile(r"^(.*)\((.*)\)$")
@@ -329,7 +336,7 @@ class FieldType(ABC):
     FLOAT_FACTOR_PATTERN = re.compile(r"^(\D+)(\d+)$")
 
     @staticmethod
-    def parse(type_text: str) -> "FieldType":
+    def parse(type_text: str) -> "PreType":
         mo = __class__.TYPE_INFO_PATTERN.fullmatch(type_text)
         if mo is None:
             raise ValueError("malformed or undefined type: %r" % type_text)
@@ -342,8 +349,57 @@ class FieldType(ABC):
             dataio_type = mo.group(1)
             float_factor = int(mo.group(2))
             return FloatType(dataio_type, public_type, float_factor)
-        else:
-            return BasicType(dataio_type, public_type)
+
+        if dataio_type in ("string", "estring"):
+            return NeedSizeType(dataio_type, public_type, StringType)
+        if dataio_type == "memory":
+            return NeedSizeType(dataio_type, public_type, MemoryType)
+        if dataio_type == "city_map":
+            return NeedSizeType(dataio_type, public_type, CityMapType)
+        if dataio_type == "bitvector":
+            return BitvectorType(dataio_type, public_type)
+        if dataio_type == "worklist":
+            return WorklistType(dataio_type, public_type)
+        if dataio_type == "cm_parameter":
+            return CMParamType(dataio_type, public_type)
+        if public_type.startswith("struct "):
+            return StructType(dataio_type, public_type)
+        if public_type == "bool":
+            return BoolType(dataio_type, public_type)
+        if public_type == "int":
+            return IntType(dataio_type, public_type)
+
+        return BasicType(dataio_type, public_type)
+
+    @abstractmethod
+    def array(self, size: ArraySize) -> "FieldType":
+        raise NotImplementedError
+
+    @abstractmethod
+    def __str__(self) -> str:
+        return super().__str__()
+
+    def __repr__(self) -> str:
+        return "{self.__class__.__name__}<{self}>".format(self = self)
+
+class NeedSizeType(PreType):
+    """Pre-types that require one size to become a real type"""
+
+    def __init__(self, dataio_type: str, public_type: str,
+                 cls: "typing.Callable[[str, str, ArraySize], FieldType]"):
+        self.dataio_type = dataio_type
+        self.public_type = public_type
+        self.cls = cls
+
+    def array(self, size: ArraySize) -> "FieldType":
+        return self.cls(self.dataio_type, self.public_type, size)
+
+    def __str__(self) -> str:
+        return "%s(%s)" % (self.dataio_type, self.public_type)
+
+
+class FieldType(PreType):
+    """Abstract base class (ABC) for different field types"""
 
     array_sizes = ()
 
@@ -351,25 +407,141 @@ class FieldType(ABC):
     def __init__(self):
         self.dataio_type = str()
         self.public_type = str()
-        self.float_factor = int()
+
+    @property
+    def float_factor(self) -> int:
+        raise AttributeError("non-float field type has no float factor")
+
+    def _require_public(self, req: str):
+        if self.public_type != req:
+            raise ValueError("{self.dataio_type} type {self} must have public type '{req}'".format(self = self, req = req))
 
     def array(self, size: ArraySize) -> "FieldType":
         return ArrayType(self, size)
+
+    @abstractmethod
+    def get_declaration(self, name: str) -> str:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def handle_type(self) -> str:
+        raise NotImplementedError
 
 class BasicType(FieldType):
     def __init__(self, dataio_type: str, public_type: str):
         self.dataio_type = dataio_type
         self.public_type = public_type
 
-    @property
-    def float_factor(self):
-        raise AttributeError("non-float field type has no float factor")
+    def __str__(self) -> str:
+        return "%s(%s)" % (self.dataio_type, self.public_type)
 
-class FloatType(FieldType):
+    def get_declaration(self, name: str) -> str:
+        return "%s %s" % (self.public_type, name)
+    
+    @property
+    def handle_type(self) -> str:
+        return self.public_type + " "
+
+class BoolType(BasicType):
+    def __init__(self, dataio_type: str, public_type: str):
+        super().__init__(dataio_type, public_type)
+        assert self.public_type == "bool", repr(self)
+
+class IntType(BasicType):
+    def __init__(self, dataio_type: str, public_type: str):
+        super().__init__(dataio_type, public_type)
+        assert self.public_type == "int", repr(self)
+
+class FloatType(BasicType):
     def __init__(self, dataio_type: str, public_type: str, float_factor: int):
+        super().__init__(dataio_type, public_type)
+        self._float_factor = float_factor
+        assert self.public_type == "float", repr(self)
+        if self.dataio_type not in ("ufloat", "sfloat"):
+            raise ValueError("float type %s must have dataio type 'ufloat' or 'sfloat'" % self)
+
+    @property
+    def float_factor(self) -> int:
+        return self._float_factor
+
+    def __str__(self) -> str:
+        return "%s%d(%s)" % (self.dataio_type, self.float_factor, self.public_type)
+
+class BitvectorType(BasicType):
+    def __init__(self, dataio_type: str, public_type: str):
+        super().__init__(dataio_type, public_type)
+        assert self.dataio_type == "bitvector", repr(self)
+
+    def array(self, size: ArraySize) -> "FieldType":
+        raise ValueError("bitvector arrays not supported")
+
+class StructType(BasicType):
+    def __init__(self, dataio_type: str, public_type: str):
+        super().__init__(dataio_type, public_type)
+        assert self.public_type.startswith("struct "), repr(self)
+
+class WorklistType(StructType):
+    def __init__(self, dataio_type: str, public_type: str):
+        super().__init__(dataio_type, public_type)
+        assert self.dataio_type == "worklist", repr(self)
+        self._require_public("struct worklist")
+
+    def array(self, size: ArraySize) -> "FieldType":
+        raise ValueError("worklist arrays not supported")
+
+    @property
+    def handle_type(self) -> str:
+        return "const %s*" % super().handle_type
+
+class CMParamType(StructType):
+    def __init__(self, dataio_type: str, public_type: str):
+        super().__init__(dataio_type, public_type)
+        assert self.dataio_type == "cm_parameter", repr(self)
+        self._require_public("struct cm_parameter")
+
+    def array(self, size: ArraySize) -> "FieldType":
+        raise ValueError("cm_parameter arrays not supported")
+
+class OneSizeType(FieldType):
+    """Base class for types that require one array dimension to be useable"""
+
+    def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
         self.dataio_type = dataio_type
         self.public_type = public_type
-        self.float_factor = float_factor
+        self.size = size
+
+    @cached_property
+    def array_sizes(self) -> "tuple[ArraySize]":
+        return (self.size,)
+
+    def __str__(self) -> str:
+        return "%s(%s)[%s]" % (self.dataio_type, self.public_type, self.size)
+
+    def get_declaration(self, name: str) -> str:
+        return "%s %s[%s]" % (self.public_type, name, self.size.max_length)
+
+    @property
+    def handle_type(self) -> str:
+        return "const %s *" % self.public_type
+
+class StringType(OneSizeType):
+    def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
+        super().__init__(dataio_type, public_type, size)
+        assert self.dataio_type in ("string", "estring"), repr(self)
+        self._require_public("char")
+
+class MemoryType(OneSizeType):
+    def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
+        super().__init__(dataio_type, public_type, size)
+        assert self.dataio_type == "memory", repr(self)
+        self._require_public("unsigned char")
+
+class CityMapType(OneSizeType):
+    def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
+        super().__init__(dataio_type, public_type, size)
+        assert self.dataio_type == "city_map", repr(self)
+        self._require_public("char")
 
 class ArrayType(FieldType):
     def __init__(self, element_type: FieldType, size: ArraySize):
@@ -391,6 +563,16 @@ class ArrayType(FieldType):
     @cached_property
     def array_sizes(self) -> "tuple[ArraySize]":
         return (self.size,) + self.element_type.array_sizes
+
+    def __str__(self) -> str:
+        return "%s[%s]" % (self.element_type, self.size)
+
+    def get_declaration(self, name: str) -> str:
+        return self.element_type.get_declaration("%s[%s]" % (name, self.size.max_length))
+
+    @property
+    def handle_type(self) -> str:
+        return "const %s *" % self.public_type
 
 
 class FieldFlagInfo:
@@ -446,44 +628,49 @@ class FieldFlagInfo:
             raise ValueError("same capabilities as both add-cap and remove-cap: %s" % " ".join(double_caps))
 
 
-# matches an entire field definition line (type, fields and flag info)
-FIELDS_LINE_PATTERN = re.compile(r"^\s*(\S+(?:\(.*\))?)\s+([^;()]*)\s*;\s*(.*)\s*$")
-# matches any field definition with an array size at the end
-ARRAY_PATTERN = re.compile(r"^(.*)\[([^][]*)\]$")
-
-# Parses a line of the form "COORD x, y; key" and yields
-# Field objects. types is a dict mapping type aliases to their meaning
-def parse_fields(line: str, types: typing.MutableMapping[str, FieldType]) -> "typing.Iterable[Field]":
-    mo = FIELDS_LINE_PATTERN.fullmatch(line)
-    if mo is None:
-        raise ValueError("invalid field definition: %r" % line)
-    type_text, fields, flags = (i.strip() for i in mo.groups(""))
-
-    # analyze type
-    if type_text not in types:
-        types[type_text] = FieldType.parse(type_text)
-    typeinfo = types[type_text]
-
-    flaginfo = FieldFlagInfo.parse(flags)
-
-    # analyze fields
-    for field_text in fields.split(","):
-        field_text = field_text.strip()
-        field_type = typeinfo
-
-        # successively parse array dimensions *from right to left*
-        ## while (mo := ARRAY_PATTERN.fullmatch(field_text)) is not None:
-        mo = ARRAY_PATTERN.fullmatch(field_text)
-        while mo is not None:
-            field_text = mo.group(1)
-            field_type = field_type.array(ArraySize.parse(mo.group(2)))
-            mo = ARRAY_PATTERN.fullmatch(field_text)
-
-        yield Field(field_text, field_type, flaginfo)
-
-# Class for a field (part of a packet). It has a name, serveral types,
-# flags and some other attributes.
 class Field:
+    """A single field of a packet. Has a name, a type (including array
+    dimensions) and various flags."""
+
+    # matches an entire field definition line (type, fields and flag info)
+    FIELDS_LINE_PATTERN = re.compile(r"^\s*(\S+(?:\(.*\))?)\s+([^;()]*)\s*;\s*(.*)\s*$")
+    # matches any field definition with an array size at the end
+    ARRAY_PATTERN = re.compile(r"^(.*)\[([^][]*)\]$")
+
+    # Parses a line of the form "COORD x, y; key" and yields
+    # Field objects. types is a dict mapping type aliases to their meaning
+    @classmethod
+    def parse(cls, line: str, types: typing.MutableMapping[str, PreType]) -> "typing.Iterable[Field]":
+        mo = cls.FIELDS_LINE_PATTERN.fullmatch(line)
+        if mo is None:
+            raise ValueError("invalid field definition: %r" % line)
+        type_text, fields, flags = (i.strip() for i in mo.groups(""))
+
+        # analyze type
+        if type_text not in types:
+            types[type_text] = FieldType.parse(type_text)
+        typeinfo = types[type_text]
+
+        flaginfo = FieldFlagInfo.parse(flags)
+
+        # analyze fields
+        for field_text in fields.split(","):
+            field_text = field_text.strip()
+            field_type = typeinfo
+
+            # successively parse array dimensions *from right to left*
+            ## while (mo := ARRAY_PATTERN.fullmatch(field_text)) is not None:
+            mo = cls.ARRAY_PATTERN.fullmatch(field_text)
+            while mo is not None:
+                field_text = mo.group(1)
+                field_type = field_type.array(ArraySize.parse(mo.group(2)))
+                mo = cls.ARRAY_PATTERN.fullmatch(field_text)
+
+            if not isinstance(field_type, FieldType):
+                raise ValueError("cannot use %s without specifying size" % field_type)
+
+            yield cls(field_text, field_type, flaginfo)
+
     def __init__(self, name: str, typeinfo: FieldType, flaginfo: FieldFlagInfo):
         self.name = name
         self.type = typeinfo
@@ -621,34 +808,28 @@ class Field:
         )
 
     def get_handle_type(self) -> str:
-        if self.dataio_type=="string" or self.dataio_type=="estring":
-            return "const char *"
-        if self.dataio_type=="worklist":
-            return "const %s *"%self.struct_type
-        if self.is_array:
-            return "const %s *"%self.struct_type
-        return self.struct_type+" "
+        return self.type.handle_type
 
     # Returns code which is used in the declaration of the field in
     # the packet struct.
     def get_declar(self) -> str:
-        if self.is_array==2:
-            return "{self.struct_type} {self.name}[{self.array_size1_d}][{self.array_size2_d}]".format(self = self)
-        if self.is_array:
-            return "{self.struct_type} {self.name}[{self.array_size_d}]".format(self = self)
-        else:
-            return "{self.struct_type} {self.name}".format(self = self)
+        return self.type.get_declaration(self.name)
 
     # Returns code which copies the arguments of the direct send
     # functions in the packet struct.
     def get_fill(self) -> str:
         if self.dataio_type=="worklist":
+            assert isinstance(self.type, WorklistType), repr(self.type)
             return "  worklist_copy(&real_packet->{self.name}, {self.name});".format(self = self)
         if self.is_array==0:
+            assert isinstance(self.type, BasicType), repr(self.type)
+            assert not isinstance(self.type, WorklistType), repr(self.type)
             return "  real_packet->{self.name} = {self.name};".format(self = self)
         if self.dataio_type=="string" or self.dataio_type=="estring":
+            assert isinstance(self.type, StringType), repr(self.type)
             return "  sz_strlcpy(real_packet->{self.name}, {self.name});".format(self = self)
         if self.is_array==1:
+            assert isinstance(self.type, ArrayType), repr(self.type)
             return """  {{
     int i;
 
@@ -663,27 +844,43 @@ class Field:
     # instances of "old" and "readl_packet".
     def get_cmp(self) -> str:
         if self.dataio_type=="memory":
+            assert isinstance(self.type, MemoryType), repr(self.type)
             return "  differ = (memcmp(old->{self.name}, real_packet->{self.name}, {self.array_size_d}) != 0);".format(self = self)
         if self.dataio_type=="bitvector":
+            assert isinstance(self.type, BitvectorType), repr(self.type)
             return "  differ = !BV_ARE_EQUAL(old->{self.name}, real_packet->{self.name});".format(self = self)
         if self.dataio_type in ["string", "estring"] and self.is_array==1:
+            assert isinstance(self.type, StringType), repr(self.type)
             return "  differ = (strcmp(old->{self.name}, real_packet->{self.name}) != 0);".format(self = self)
         if self.dataio_type == "cm_parameter":
+            assert isinstance(self.type, CMParamType), repr(self.type)
             return "  differ = !cm_are_parameter_equal(&old->{self.name}, &real_packet->{self.name});".format(self = self)
         if self.is_struct and self.is_array==0:
+            assert isinstance(self.type, StructType), repr(self.type)
+            assert not isinstance(self.type, CMParamType), repr(self.type)
             return "  differ = !are_{self.dataio_type}s_equal(&old->{self.name}, &real_packet->{self.name});".format(self = self)
         if not self.is_array:
+            assert isinstance(self.type, BasicType), repr(self.type)
+            assert not isinstance(self.type, StructType), repr(self.type)
             return "  differ = (old->{self.name} != real_packet->{self.name});".format(self = self)
 
+        assert isinstance(self.type, ArrayType), repr(self.type)
+        assert not isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
+
         if self.dataio_type=="string" or self.dataio_type=="estring":
+            assert isinstance(self.type.element_type, StringType), repr(self.type.element_type)
             c = "strcmp(old->{self.name}[i], real_packet->{self.name}[i]) != 0".format(self = self)
             array_size_u = self.array_size1_u
             array_size_o = self.array_size1_o
         elif self.is_struct:
+            assert isinstance(self.type.element_type, StructType), repr(self.type.element_type)
+            assert not isinstance(self.type.element_type, CMParamType), repr(self.type.element_type)
             c = "!are_{self.dataio_type}s_equal(&old->{self.name}[i], &real_packet->{self.name}[i])".format(self = self)
             array_size_u = self.array_size_u
             array_size_o = self.array_size_o
         else:
+            assert isinstance(self.type.element_type, BasicType), repr(self.type.element_type)
+            assert not isinstance(self.type.element_type, StructType), repr(self.type.element_type)
             c = "old->{self.name}[i] != real_packet->{self.name}[i]".format(self = self)
             array_size_u = self.array_size_u
             array_size_o = self.array_size_o
@@ -707,8 +904,7 @@ class Field:
     def folded_into_head(self) -> bool:
         return (
             fold_bool_into_header
-            and self.struct_type == "bool"
-            and not self.is_array
+            and isinstance(self.type, BoolType)
         )
 
     # Returns a code fragment which updates the bit of the this field
@@ -717,6 +913,7 @@ class Field:
     # value of the bool.
     def get_cmp_wrapper(self, i: int, pack: "Variant") -> str:
         if self.folded_into_head:
+            assert isinstance(self.type, BoolType), repr(self.type)
             if pack.is_info != "no":
                 cmp = self.get_cmp()
                 differ_part = '''
@@ -755,6 +952,7 @@ class Field:
     # content has changed. Does nothing for bools-in-header.
     def get_put_wrapper(self, packet: "Variant", i: int, deltafragment: bool) -> str:
         if self.folded_into_head:
+            assert isinstance(self.type, BoolType), repr(self.type)
             return "  /* field {i:d} is folded into the header */\n".format(i = i)
         put=self.get_put(deltafragment)
         if packet.gen_log:
@@ -787,48 +985,76 @@ class Field:
     # The code which put this field before it is wrapped in address adding.
     def get_put_real(self, deltafragment: bool) -> str:
         if self.dataio_type=="bitvector":
+            assert isinstance(self.type, BitvectorType), repr(self.type)
             return "DIO_BV_PUT(&dout, &field_addr, packet->{self.name});".format(self = self)
+        assert not isinstance(self.type, BitvectorType), repr(self.type)
 
         if self.struct_type=="float" and not self.is_array:
+            assert isinstance(self.type, FloatType), repr(self.type)
             return "  DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}, {self.float_factor:d});".format(self = self)
+        assert not isinstance(self.type, FloatType), repr(self.type)
 
         if self.dataio_type in ["worklist", "cm_parameter"]:
+            assert isinstance(self.type, (WorklistType, CMParamType)), repr(self.type)
             return "  DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{self.name});".format(self = self)
+        assert not isinstance(self.type, (WorklistType, CMParamType)), repr(self.type)
 
         if self.dataio_type in ["memory"]:
+            assert isinstance(self.type, MemoryType), repr(self.type)
             return "  DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{self.name}, {self.array_size_u});".format(self = self)
+        assert not isinstance(self.type, MemoryType), repr(self.type)
 
         arr_types=["string","estring","city_map"]
         if (self.dataio_type in arr_types and self.is_array==1) or \
            (self.dataio_type not in arr_types and self.is_array==0):
+            assert not isinstance(self.type, ArrayType), repr(self.type)
             return "  DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name});".format(self = self)
+        assert isinstance(self.type, ArrayType), repr(self.type)
+
         if self.is_struct:
             if self.is_array==2:
+                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
+                assert isinstance(self.type.element_type.element_type, StructType), repr(self.type.element_type.element_type)
+                assert not isinstance(self.type.element_type.element_type, (WorklistType, CMParamType)), repr(self.type.element_type.element_type)
                 c = "DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{self.name}[i][j]);".format(self = self)
                 array_size_u = "#error Codegen error"   # avoid "possibly unbound" warnings
             else:
+                assert isinstance(self.type.element_type, StructType), repr(self.type.element_type)
+                assert not isinstance(self.type.element_type, (WorklistType, CMParamType)), repr(self.type.element_type)
                 c = "DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{self.name}[i]);".format(self = self)
                 array_size_u = self.array_size_u
         elif self.dataio_type=="string" or self.dataio_type=="estring":
+            assert isinstance(self.type.element_type, StringType), repr(self.type.element_type)
             c = "DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}[i]);".format(self = self)
             array_size_u=self.array_size1_u
 
         elif self.struct_type=="float":
             if self.is_array==2:
+                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
+                assert isinstance(self.type.element_type.element_type, FloatType), repr(self.type.element_type.element_type)
                 c = "  DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}[i][j], {self.float_factor:d});".format(self = self)
                 array_size_u = "#error Codegen error"   # avoid "possibly unbound" warnings
             else:
+                assert isinstance(self.type.element_type, FloatType), repr(self.type.element_type)
                 c = "  DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}[i], {self.float_factor:d});".format(self = self)
                 array_size_u = self.array_size_u
         else:
             if self.is_array==2:
+                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
+                assert isinstance(self.type.element_type.element_type, BasicType), repr(self.type.element_type.element_type)
+                assert not isinstance(self.type.element_type.element_type, StructType), repr(self.type.element_type.element_type)
+                assert not isinstance(self.type.element_type.element_type, FloatType), repr(self.type.element_type.element_type)
                 c = "DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}[i][j]);".format(self = self)
                 array_size_u = "#error Codegen error"   # avoid "possibly unbound" warnings
             else:
+                assert isinstance(self.type.element_type, BasicType), repr(self.type.element_type)
+                assert not isinstance(self.type.element_type, StructType), repr(self.type.element_type)
+                assert not isinstance(self.type.element_type, FloatType), repr(self.type.element_type)
                 c = "DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}[i]);".format(self = self)
                 array_size_u = self.array_size_u
 
         if deltafragment and self.diff and self.is_array == 1:
+            assert not isinstance(self.type.element_type, (StringType, ArrayType)), repr(self.type.element_type)
             return """
     {{
       int i;
@@ -902,6 +1128,7 @@ class Field:
     }}""".format(self = self, c = c)
         if self.is_array == 2 and self.dataio_type != "string" \
            and self.dataio_type != "estring":
+            assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
             return """
     {{
       int i, j;
@@ -948,6 +1175,7 @@ class Field:
 #endif /* FREECIV_JSON_CONNECTION */
     }}""".format(self = self, c = c)
         else:
+            assert not isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
             return """
     {{
       int i;
@@ -979,6 +1207,7 @@ class Field:
     # "fields" bitvector says so.
     def get_get_wrapper(self, packet: "Variant", i: int, deltafragment: bool) -> str:
         if self.folded_into_head:
+            assert isinstance(self.type, BoolType), repr(self.type)
             return  "  real_packet->{self.name} = BV_ISSET(fields, {i:d});\n".format(self = self, i = i)
         get = prefix("    ", self.get_get(deltafragment))
         if packet.gen_log:
@@ -1002,33 +1231,48 @@ field_addr.name = \"{self.name}\";
     # The code which get this field before it is wrapped in address adding.
     def get_get_real(self, deltafragment: bool) -> str:
         if self.struct_type=="float" and not self.is_array:
+            assert isinstance(self.type, FloatType), repr(self.type)
             return """\
 if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}, {self.float_factor:d})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
+        assert not isinstance(self.type, FloatType), repr(self.type)
+
         if self.dataio_type=="bitvector":
+            assert isinstance(self.type, BitvectorType), repr(self.type)
             return """\
 if (!DIO_BV_GET(&din, &field_addr, real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
+        assert not isinstance(self.type, BitvectorType), repr(self.type)
+
         if self.dataio_type in ["string","estring","city_map"] and \
            self.is_array!=2:
+            assert isinstance(self.type, (StringType, CityMapType)), repr(self.type)
             return """\
 if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}, sizeof(real_packet->{self.name}))) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
+        assert not isinstance(self.type, (StringType, CityMapType)), repr(self.type)
+
         if self.is_struct and self.is_array==0:
+            assert isinstance(self.type, StructType), repr(self.type)
             return """\
 if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
+        assert not isinstance(self.type, StructType), repr(self.type)
+
         if not self.is_array:
+            assert not isinstance(self.type, (ArrayType, MemoryType)), repr(self.type)
             if self.struct_type in ["int","bool"]:
+                assert isinstance(self.type, (IntType, BoolType)), repr(self.type)
                 return """\
 if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
             else:
+                assert type(self.type) is BasicType, repr(self.type)
                 return """\
 {{
   int readin;
@@ -1038,35 +1282,50 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
   }}
   real_packet->{self.name} = readin;
 }}""".format(self = self)
+        assert isinstance(self.type, (ArrayType, MemoryType)), repr(self.type)
 
         if self.is_struct:
+            assert not isinstance(self.type, MemoryType), repr(self.type)
             if self.is_array==2:
+                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
+                assert isinstance(self.type.element_type.element_type, StructType), repr(self.type.element_type.element_type)
                 c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i][j])) {{
       RECEIVE_PACKET_FIELD_ERROR({self.name});
     }}""".format(self = self)
             else:
+                assert isinstance(self.type.element_type, StructType), repr(self.type.element_type)
                 c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i])) {{
       RECEIVE_PACKET_FIELD_ERROR({self.name});
     }}""".format(self = self)
         elif self.dataio_type=="string" or self.dataio_type=="estring":
+            assert not isinstance(self.type, MemoryType), repr(self.type)
+            assert isinstance(self.type.element_type, StringType), repr(self.type.element_type)
             c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}[i], sizeof(real_packet->{self.name}[i]))) {{
       RECEIVE_PACKET_FIELD_ERROR({self.name});
     }}""".format(self = self)
         elif self.struct_type=="float":
+            assert not isinstance(self.type, MemoryType), repr(self.type)
             if self.is_array==2:
+                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
+                assert isinstance(self.type.element_type.element_type, FloatType), repr(self.type.element_type.element_type)
                 c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i][j], {self.float_factor:d})) {{
       RECEIVE_PACKET_FIELD_ERROR({self.name});
     }}""".format(self = self)
             else:
+                assert isinstance(self.type.element_type, FloatType), repr(self.type.element_type)
                 c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i], {self.float_factor:d})) {{
       RECEIVE_PACKET_FIELD_ERROR({self.name});
     }}""".format(self = self)
         elif self.is_array==2:
+            assert not isinstance(self.type, MemoryType), repr(self.type)
+            assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
             if self.struct_type in ["int","bool"]:
+                assert isinstance(self.type.element_type.element_type, (IntType, BoolType)), repr(self.type.element_type.element_type)
                 c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i][j])) {{
       RECEIVE_PACKET_FIELD_ERROR({self.name});
     }}""".format(self = self)
             else:
+                assert type(self.type.element_type.element_type) is BasicType, repr(self.type.element_type.element_type)
                 c = """{{
       int readin;
 
@@ -1076,10 +1335,13 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
       real_packet->{self.name}[i][j] = readin;
     }}""".format(self = self)
         elif self.struct_type in ["int","bool"]:
+            assert not isinstance(self.type, MemoryType), repr(self.type)
+            assert isinstance(self.type.element_type, (IntType, BoolType)), repr(self.type.element_type)
             c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i])) {{
       RECEIVE_PACKET_FIELD_ERROR({self.name});
     }}""".format(self = self)
         else:
+            assert isinstance(self.type, MemoryType) or type(self.type.element_type) is BasicType, repr(self.type.element_type)
             c = """{{
       int readin;
 
@@ -1105,12 +1367,15 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
             else:
                 extra=""
             if self.dataio_type=="memory":
+                assert isinstance(self.type, MemoryType), repr(self.type)
                 return """{extra}
   if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}, {array_size_u})) {{
     RECEIVE_PACKET_FIELD_ERROR({self.name});
   }}""".format(self = self, array_size_u = array_size_u, extra = extra)
             elif self.is_array==2 and self.dataio_type!="string" \
                  and self.dataio_type!="estring":
+                assert not isinstance(self.type, MemoryType), repr(self.type)
+                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
                 return """
 {{
   int i, j;
@@ -1150,6 +1415,8 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
 #endif /* FREECIV_JSON_CONNECTION */
 }}""".format(self = self, c = c, extra = extra)
             else:
+                assert not isinstance(self.type, MemoryType), repr(self.type)
+                assert not isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
                 return """
 {{
   int i;
@@ -1173,6 +1440,8 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
 #endif /* FREECIV_JSON_CONNECTION */
 }}""".format(array_size_u = array_size_u, c = c, extra = extra)
         elif deltafragment and self.diff and self.is_array == 1:
+            assert not isinstance(self.type, MemoryType), repr(self.type)
+            assert not isinstance(self.type.element_type, (ArrayType, StringType)), repr(self.type.element_type)
             return """
 {{
 #ifdef FREECIV_JSON_CONNECTION
@@ -1236,6 +1505,8 @@ field_addr.sub_location = NULL;
 #endif /* FREECIV_JSON_CONNECTION */
 }}""".format(self = self, array_size_u = array_size_u, c = c)
         else:
+            assert not isinstance(self.type, MemoryType), repr(self.type)
+            assert not isinstance(self.type.element_type, (ArrayType, StringType)), repr(self.type.element_type)
             return """
 {{
   int i;
@@ -1840,7 +2111,7 @@ class Packet:
     # matches a packet cancel flag (cancelled packet type)
     CANCEL_PATTERN = re.compile(r"^cancel\((.*)\)$")
 
-    def __init__(self, text: str, types: typing.MutableMapping[str, FieldType]):
+    def __init__(self, text: str, types: typing.MutableMapping[str, PreType]):
         text = text.strip()
         lines = text.split("\n")
 
@@ -1929,7 +2200,7 @@ class Packet:
         self.fields = [
             field
             for line in lines
-            for field in parse_fields(line, types)
+            for field in Field.parse(line, types)
         ]
         self.key_fields = [field for field in self.fields if field.is_key]
         self.other_fields = [field for field in self.fields if not field.is_key]
@@ -2460,7 +2731,7 @@ def parse_packets_def(def_text: str) -> typing.Iterable[Packet]:
         if alias in types:
             raise ValueError("duplicate type alias %r" % alias)
         if dest not in types:
-            types[dest] = FieldType.parse(dest)
+            types[dest] = PreType.parse(dest)
         types[alias] = types[dest]
 
     # parse packet definitions
