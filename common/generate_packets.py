@@ -287,8 +287,8 @@ def powerset(iterable: typing.Iterable[T_co]) -> "typing.Iterator[tuple[T_co, ..
     return chain.from_iterable(combinations(s, r) for r in range(len(s)+1))
 
 def prefix(prefix: str, text: str) -> str:
-    """Prepend prefix to every line of text"""
-    return "\n".join(prefix + line for line in text.split("\n"))
+    """Prepend prefix to every line of text, except blank lines"""
+    return "\n".join(line and (prefix + line) for line in text.split("\n"))
 
 
 ############################ Field type classes ############################
@@ -428,6 +428,10 @@ class FieldType(PreType):
     def handle_type(self) -> str:
         raise NotImplementedError
 
+    @abstractmethod
+    def get_fill(self, name: str, depth: int = 0) -> str:
+        raise NotImplementedError
+
 class BasicType(FieldType):
     def __init__(self, dataio_type: str, public_type: str):
         self.dataio_type = dataio_type
@@ -442,6 +446,9 @@ class BasicType(FieldType):
     @property
     def handle_type(self) -> str:
         return self.public_type + " "
+
+    def get_fill(self, name: str, depth: int = 0) -> str:
+        return "real_packet->{name} = {name};".format(name = name)
 
 class BoolType(BasicType):
     def __init__(self, dataio_type: str, public_type: str):
@@ -494,6 +501,9 @@ class WorklistType(StructType):
     def handle_type(self) -> str:
         return "const %s*" % super().handle_type
 
+    def get_fill(self, name: str, depth: int = 0) -> str:
+        return "worklist_copy(&real_packet->{name}, {name});".format(name = name)
+
 class CMParamType(StructType):
     def __init__(self, dataio_type: str, public_type: str):
         super().__init__(dataio_type, public_type)
@@ -531,11 +541,17 @@ class StringType(OneSizeType):
         assert self.dataio_type in ("string", "estring"), repr(self)
         self._require_public("char")
 
+    def get_fill(self, name: str, depth: int = 0) -> str:
+        return "sz_strlcpy(real_packet->{name}, {name});".format(name = name)
+
 class MemoryType(OneSizeType):
     def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
         super().__init__(dataio_type, public_type, size)
         assert self.dataio_type == "memory", repr(self)
         self._require_public("unsigned char")
+
+    def get_fill(self, name: str, depth: int = 0) -> str:
+        raise ValueError("dsend not supported with field of type %s" % self)
 
 class CityMapType(OneSizeType):
     def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
@@ -543,7 +559,12 @@ class CityMapType(OneSizeType):
         assert self.dataio_type == "city_map", repr(self)
         self._require_public("char")
 
+    def get_fill(self, name: str, depth: int = 0) -> str:
+        raise ValueError("dsend not supported with field of type %s" % self)
+
 class ArrayType(FieldType):
+    INDICES = "ijk"
+
     def __init__(self, element_type: FieldType, size: ArraySize):
         self.element_type = element_type
         self.size = size
@@ -573,6 +594,20 @@ class ArrayType(FieldType):
     @property
     def handle_type(self) -> str:
         return "const %s *" % self.public_type
+
+    def get_fill(self, name: str, depth: int = 0) -> str:
+        if depth >= len(self.INDICES):
+            raise ValueError("arrays nested too deep: %s" % self)
+        index = self.INDICES[depth]
+        inner = prefix("    ", self.element_type.get_fill("%s[%s]" % (name, index), depth + 1))
+        return """\
+{{
+  int i;
+
+  for (i = 0; i < {self.size.real}; i++) {{
+{inner}
+  }}
+}}""".format(self = self, inner = inner)
 
 
 class FieldFlagInfo:
@@ -818,87 +853,49 @@ class Field:
     # Returns code which copies the arguments of the direct send
     # functions in the packet struct.
     def get_fill(self) -> str:
-        if self.dataio_type=="worklist":
-            assert isinstance(self.type, WorklistType), repr(self.type)
-            return "  worklist_copy(&real_packet->{self.name}, {self.name});".format(self = self)
-        if self.is_array==0:
-            assert isinstance(self.type, BasicType), repr(self.type)
-            assert not isinstance(self.type, WorklistType), repr(self.type)
-            return "  real_packet->{self.name} = {self.name};".format(self = self)
-        if self.dataio_type=="string" or self.dataio_type=="estring":
-            assert isinstance(self.type, StringType), repr(self.type)
-            return "  sz_strlcpy(real_packet->{self.name}, {self.name});".format(self = self)
-        if self.is_array==1:
-            assert isinstance(self.type, ArrayType), repr(self.type)
-            return """  {{
-    int i;
-
-    for (i = 0; i < {self.array_size_u}; i++) {{
-      real_packet->{self.name}[i] = {self.name}[i];
-    }}
-  }}""".format(self = self)
-
-        return repr(self.__dict__)
+        return prefix("  ", self.type.get_fill(self.name))
 
     # Returns code which sets "differ" by comparing the field
     # instances of "old" and "readl_packet".
     def get_cmp(self) -> str:
-        if self.dataio_type=="memory":
-            assert isinstance(self.type, MemoryType), repr(self.type)
+        if isinstance(self.type, MemoryType):
             return "  differ = (memcmp(old->{self.name}, real_packet->{self.name}, {self.array_size_d}) != 0);".format(self = self)
-        if self.dataio_type=="bitvector":
-            assert isinstance(self.type, BitvectorType), repr(self.type)
+        if isinstance(self.type, BitvectorType):
             return "  differ = !BV_ARE_EQUAL(old->{self.name}, real_packet->{self.name});".format(self = self)
-        if self.dataio_type in ["string", "estring"] and self.is_array==1:
-            assert isinstance(self.type, StringType), repr(self.type)
+        if isinstance(self.type, StringType):
             return "  differ = (strcmp(old->{self.name}, real_packet->{self.name}) != 0);".format(self = self)
-        if self.dataio_type == "cm_parameter":
-            assert isinstance(self.type, CMParamType), repr(self.type)
+        if isinstance(self.type, CMParamType):
             return "  differ = !cm_are_parameter_equal(&old->{self.name}, &real_packet->{self.name});".format(self = self)
-        if self.is_struct and self.is_array==0:
-            assert isinstance(self.type, StructType), repr(self.type)
-            assert not isinstance(self.type, CMParamType), repr(self.type)
+        if isinstance(self.type, StructType):
             return "  differ = !are_{self.dataio_type}s_equal(&old->{self.name}, &real_packet->{self.name});".format(self = self)
-        if not self.is_array:
-            assert isinstance(self.type, BasicType), repr(self.type)
-            assert not isinstance(self.type, StructType), repr(self.type)
+        if isinstance(self.type, BasicType):
             return "  differ = (old->{self.name} != real_packet->{self.name});".format(self = self)
 
         assert isinstance(self.type, ArrayType), repr(self.type)
-        assert not isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
 
-        if self.dataio_type=="string" or self.dataio_type=="estring":
-            assert isinstance(self.type.element_type, StringType), repr(self.type.element_type)
+        if isinstance(self.type.element_type, StringType):
             c = "strcmp(old->{self.name}[i], real_packet->{self.name}[i]) != 0".format(self = self)
-            array_size_u = self.array_size1_u
-            array_size_o = self.array_size1_o
-        elif self.is_struct:
-            assert isinstance(self.type.element_type, StructType), repr(self.type.element_type)
-            assert not isinstance(self.type.element_type, CMParamType), repr(self.type.element_type)
+        elif isinstance(self.type.element_type, StructType):
             c = "!are_{self.dataio_type}s_equal(&old->{self.name}[i], &real_packet->{self.name}[i])".format(self = self)
-            array_size_u = self.array_size_u
-            array_size_o = self.array_size_o
-        else:
-            assert isinstance(self.type.element_type, BasicType), repr(self.type.element_type)
-            assert not isinstance(self.type.element_type, StructType), repr(self.type.element_type)
+        elif isinstance(self.type.element_type, BasicType):
             c = "old->{self.name}[i] != real_packet->{self.name}[i]".format(self = self)
-            array_size_u = self.array_size_u
-            array_size_o = self.array_size_o
+        else:
+            raise ValueError("cmp not supported for %s" % self.type)
 
         return """
     {{
-      differ = ({array_size_o} != {array_size_u});
+      differ = ({self.type.size.old} != {self.type.size.real});
       if (!differ) {{
         int i;
 
-        for (i = 0; i < {array_size_u}; i++) {{
+        for (i = 0; i < {self.type.size.real}; i++) {{
           if ({c}) {{
             differ = TRUE;
             break;
           }}
         }}
       }}
-    }}""".format(c = c, array_size_u = array_size_u, array_size_o = array_size_o)
+    }}""".format(self = self, c = c)
 
     @property
     def folded_into_head(self) -> bool:
@@ -984,32 +981,20 @@ class Field:
 
     # The code which put this field before it is wrapped in address adding.
     def get_put_real(self, deltafragment: bool) -> str:
-        if self.dataio_type=="bitvector":
-            assert isinstance(self.type, BitvectorType), repr(self.type)
+        if isinstance(self.type, BitvectorType):
             return "DIO_BV_PUT(&dout, &field_addr, packet->{self.name});".format(self = self)
-        assert not isinstance(self.type, BitvectorType), repr(self.type)
 
-        if self.struct_type=="float" and not self.is_array:
-            assert isinstance(self.type, FloatType), repr(self.type)
+        if isinstance(self.type, FloatType):
             return "  DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}, {self.float_factor:d});".format(self = self)
-        assert not isinstance(self.type, FloatType), repr(self.type)
 
-        if self.dataio_type in ["worklist", "cm_parameter"]:
-            assert isinstance(self.type, (WorklistType, CMParamType)), repr(self.type)
+        if isinstance(self.type, (WorklistType, CMParamType)):
             return "  DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{self.name});".format(self = self)
-        assert not isinstance(self.type, (WorklistType, CMParamType)), repr(self.type)
 
-        if self.dataio_type in ["memory"]:
-            assert isinstance(self.type, MemoryType), repr(self.type)
+        if isinstance(self.type, MemoryType):
             return "  DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{self.name}, {self.array_size_u});".format(self = self)
-        assert not isinstance(self.type, MemoryType), repr(self.type)
 
-        arr_types=["string","estring","city_map"]
-        if (self.dataio_type in arr_types and self.is_array==1) or \
-           (self.dataio_type not in arr_types and self.is_array==0):
-            assert not isinstance(self.type, ArrayType), repr(self.type)
+        if not isinstance(self.type, ArrayType):
             return "  DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name});".format(self = self)
-        assert isinstance(self.type, ArrayType), repr(self.type)
 
         if self.is_struct:
             if self.is_array==2:
@@ -1023,8 +1008,7 @@ class Field:
                 assert not isinstance(self.type.element_type, (WorklistType, CMParamType)), repr(self.type.element_type)
                 c = "DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{self.name}[i]);".format(self = self)
                 array_size_u = self.array_size_u
-        elif self.dataio_type=="string" or self.dataio_type=="estring":
-            assert isinstance(self.type.element_type, StringType), repr(self.type.element_type)
+        elif isinstance(self.type.element_type, StringType):
             c = "DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}[i]);".format(self = self)
             array_size_u=self.array_size1_u
 
@@ -1053,8 +1037,7 @@ class Field:
                 c = "DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{self.name}[i]);".format(self = self)
                 array_size_u = self.array_size_u
 
-        if deltafragment and self.diff and self.is_array == 1:
-            assert not isinstance(self.type.element_type, (StringType, ArrayType)), repr(self.type.element_type)
+        if deltafragment and self.diff and not isinstance(self.type.element_type, (StringType, ArrayType)):
             return """
     {{
       int i;
@@ -1126,9 +1109,7 @@ class Field:
       field_addr.sub_location = NULL;
 #endif /* FREECIV_JSON_CONNECTION */
     }}""".format(self = self, c = c)
-        if self.is_array == 2 and self.dataio_type != "string" \
-           and self.dataio_type != "estring":
-            assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
+        if isinstance(self.type.element_type, ArrayType):
             return """
     {{
       int i, j;
@@ -1175,7 +1156,6 @@ class Field:
 #endif /* FREECIV_JSON_CONNECTION */
     }}""".format(self = self, c = c)
         else:
-            assert not isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
             return """
     {{
       int i;
@@ -1230,50 +1210,38 @@ field_addr.name = \"{self.name}\";
 
     # The code which get this field before it is wrapped in address adding.
     def get_get_real(self, deltafragment: bool) -> str:
-        if self.struct_type=="float" and not self.is_array:
-            assert isinstance(self.type, FloatType), repr(self.type)
+        if isinstance(self.type, FloatType):
             return """\
 if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}, {self.float_factor:d})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
-        assert not isinstance(self.type, FloatType), repr(self.type)
 
-        if self.dataio_type=="bitvector":
-            assert isinstance(self.type, BitvectorType), repr(self.type)
+        if isinstance(self.type, BitvectorType):
             return """\
 if (!DIO_BV_GET(&din, &field_addr, real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
-        assert not isinstance(self.type, BitvectorType), repr(self.type)
 
-        if self.dataio_type in ["string","estring","city_map"] and \
-           self.is_array!=2:
-            assert isinstance(self.type, (StringType, CityMapType)), repr(self.type)
+        if isinstance(self.type, (StringType, CityMapType)):
             return """\
 if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}, sizeof(real_packet->{self.name}))) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
-        assert not isinstance(self.type, (StringType, CityMapType)), repr(self.type)
 
-        if self.is_struct and self.is_array==0:
-            assert isinstance(self.type, StructType), repr(self.type)
+        if isinstance(self.type, StructType):
             return """\
 if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
-        assert not isinstance(self.type, StructType), repr(self.type)
 
-        if not self.is_array:
-            assert not isinstance(self.type, (ArrayType, MemoryType)), repr(self.type)
-            if self.struct_type in ["int","bool"]:
-                assert isinstance(self.type, (IntType, BoolType)), repr(self.type)
-                return """\
+        if isinstance(self.type, (IntType, BoolType)):
+            return """\
 if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
   RECEIVE_PACKET_FIELD_ERROR({self.name});
 }}""".format(self = self)
-            else:
-                assert type(self.type) is BasicType, repr(self.type)
-                return """\
+
+        if isinstance(self.type, BasicType):
+            return """\
 {{
   int readin;
 
@@ -1282,6 +1250,7 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
   }}
   real_packet->{self.name} = readin;
 }}""".format(self = self)
+
         assert isinstance(self.type, (ArrayType, MemoryType)), repr(self.type)
 
         if self.is_struct:
@@ -1358,7 +1327,7 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
             array_size_u=self.array_size_u
             array_size_d=self.array_size_d
 
-        if not self.diff or self.dataio_type=="memory":
+        if not self.diff or isinstance(self.type, MemoryType):
             if array_size_u != array_size_d:
                 extra = """
   if ({array_size_u} > {array_size_d}) {{
@@ -1366,16 +1335,12 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
   }}""".format(self = self, array_size_u = array_size_u, array_size_d = array_size_d)
             else:
                 extra=""
-            if self.dataio_type=="memory":
-                assert isinstance(self.type, MemoryType), repr(self.type)
+            if isinstance(self.type, MemoryType):
                 return """{extra}
   if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}, {array_size_u})) {{
     RECEIVE_PACKET_FIELD_ERROR({self.name});
   }}""".format(self = self, array_size_u = array_size_u, extra = extra)
-            elif self.is_array==2 and self.dataio_type!="string" \
-                 and self.dataio_type!="estring":
-                assert not isinstance(self.type, MemoryType), repr(self.type)
-                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
+            elif isinstance(self.type.element_type, ArrayType):
                 return """
 {{
   int i, j;
@@ -1415,8 +1380,6 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
 #endif /* FREECIV_JSON_CONNECTION */
 }}""".format(self = self, c = c, extra = extra)
             else:
-                assert not isinstance(self.type, MemoryType), repr(self.type)
-                assert not isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
                 return """
 {{
   int i;
@@ -1439,9 +1402,7 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) 
   field_addr.sub_location = NULL;
 #endif /* FREECIV_JSON_CONNECTION */
 }}""".format(array_size_u = array_size_u, c = c, extra = extra)
-        elif deltafragment and self.diff and self.is_array == 1:
-            assert not isinstance(self.type, MemoryType), repr(self.type)
-            assert not isinstance(self.type.element_type, (ArrayType, StringType)), repr(self.type.element_type)
+        elif deltafragment and self.diff and not isinstance(self.type.element_type, (ArrayType, StringType)):
             return """
 {{
 #ifdef FREECIV_JSON_CONNECTION
@@ -1505,7 +1466,6 @@ field_addr.sub_location = NULL;
 #endif /* FREECIV_JSON_CONNECTION */
 }}""".format(self = self, array_size_u = array_size_u, c = c)
         else:
-            assert not isinstance(self.type, MemoryType), repr(self.type)
             assert not isinstance(self.type.element_type, (ArrayType, StringType)), repr(self.type.element_type)
             return """
 {{
