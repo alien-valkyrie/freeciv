@@ -323,12 +323,23 @@ class ArraySize:
         else:
             return "%s:%s" % (self.max_length, self._actual_length)
 
+    
+    def get_size_check(self, name: str) -> str:
+        if self._actual_length is None:
+            return ""
+        return """\
+if ({self.real} > {self.max_length}) {{
+  RECEIVE_PACKET_FIELD_ERROR({name}, ": truncation array");
+}}
+""".format(self = self, name = name)
+
+
     @classmethod
     def parse(cls, size_text: str) -> "ArraySize":
         parts = size_text.split(":")
         if len(parts) > 2:
             raise ValueError("Invalid array size declaration: %r" % size_text)
-        return cls(*size_text.split(":"))
+        return cls(*parts)
 
 
 class PreType(ABC):
@@ -413,10 +424,6 @@ class FieldType(PreType):
         self.dataio_type = str()
         self.public_type = str()
 
-    @property
-    def float_factor(self) -> int:
-        raise AttributeError("non-float field type has no float factor")
-
     def _require_public(self, req: str):
         if self.public_type != req:
             raise ValueError("{self.dataio_type} type {self} must have public type '{req}'".format(self = self, req = req))
@@ -446,6 +453,10 @@ class FieldType(PreType):
 DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{name});
 """.format(self = self, name = name)
 
+    @abstractmethod
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        raise NotImplementedError
+
 class BasicType(FieldType):
     def __init__(self, dataio_type: str, public_type: str):
         self.dataio_type = dataio_type
@@ -469,27 +480,49 @@ class BasicType(FieldType):
 differ = (old->{name} != real_packet->{name});
 """.format(name = name)
 
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        return """\
+{{
+  int readin;
+
+  if (!DIO_GET({self.dataio_type}, &din, &field_addr, &readin)) {{
+    RECEIVE_PACKET_FIELD_ERROR({name});
+  }}
+  real_packet->{name} = readin;
+}}
+""".format(self = self, name = name)
+
 class BoolType(BasicType):
     def __init__(self, dataio_type: str, public_type: str):
         super().__init__(dataio_type, public_type)
         assert self.public_type == "bool", repr(self)
+
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{name})) {{
+  RECEIVE_PACKET_FIELD_ERROR({name});
+}}
+""".format(self = self, name = name)
 
 class IntType(BasicType):
     def __init__(self, dataio_type: str, public_type: str):
         super().__init__(dataio_type, public_type)
         assert self.public_type == "int", repr(self)
 
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{name})) {{
+  RECEIVE_PACKET_FIELD_ERROR({name});
+}}
+""".format(self = self, name = name)
+
 class FloatType(BasicType):
     def __init__(self, dataio_type: str, public_type: str, float_factor: int):
         super().__init__(dataio_type, public_type)
-        self._float_factor = float_factor
+        self.float_factor = float_factor
         assert self.public_type == "float", repr(self)
         if self.dataio_type not in ("ufloat", "sfloat"):
             raise ValueError("float type %s must have dataio type 'ufloat' or 'sfloat'" % self)
-
-    @property
-    def float_factor(self) -> int:
-        return self._float_factor
 
     def __str__(self) -> str:
         return "%s%d(%s)" % (self.dataio_type, self.float_factor, self.public_type)
@@ -497,6 +530,13 @@ class FloatType(BasicType):
     def get_put(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
         return """\
 DIO_PUT({self.dataio_type}, &dout, &field_addr, real_packet->{name}, {self.float_factor:d});
+""".format(self = self, name = name)
+
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{name}, {self.float_factor:d})) {{
+  RECEIVE_PACKET_FIELD_ERROR({name});
+}}
 """.format(self = self, name = name)
 
 class BitvectorType(BasicType):
@@ -517,6 +557,13 @@ differ = !BV_ARE_EQUAL(old->{name}, real_packet->{name});
 DIO_BV_PUT(&dout, &field_addr, packet->{name});
 """.format(name = name)
 
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        return """\
+if (!DIO_BV_GET(&din, &field_addr, real_packet->{name})) {{
+  RECEIVE_PACKET_FIELD_ERROR({name});
+}}
+""".format(self = self, name = name)
+
 class StructType(BasicType):
     def __init__(self, dataio_type: str, public_type: str):
         super().__init__(dataio_type, public_type)
@@ -530,6 +577,13 @@ differ = !are_{self.dataio_type}s_equal(&old->{name}, &real_packet->{name});
     def get_put(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
         return """\
 DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{name});
+""".format(self = self, name = name)
+
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{name})) {{
+  RECEIVE_PACKET_FIELD_ERROR({name});
+}}
 """.format(self = self, name = name)
 
 class WorklistType(StructType):
@@ -584,6 +638,13 @@ class OneSizeType(FieldType):
     def handle_type(self) -> str:
         return "const %s *" % self.public_type
 
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        return """\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{name}, sizeof(real_packet->{name}))) {{
+  RECEIVE_PACKET_FIELD_ERROR({name});
+}}
+""".format(self = self, name = name)
+
 class StringType(OneSizeType):
     def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
         super().__init__(dataio_type, public_type, size)
@@ -617,6 +678,15 @@ differ = (memcmp(old->{name}, real_packet->{name}, {self.size.max_length}) != 0)
 DIO_PUT({self.dataio_type}, &dout, &field_addr, &real_packet->{name}, {self.size.real});
 """.format(self = self, name = name)
 
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        size_check = self.size.get_size_check(name)
+        return """\
+{size_check}\
+if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{name}, {self.size.real})) {{
+  RECEIVE_PACKET_FIELD_ERROR({name});
+}}
+""".format(self = self, name = name, size_check = size_check)
+
 class CityMapType(OneSizeType):
     def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
         super().__init__(dataio_type, public_type, size)
@@ -643,10 +713,6 @@ class ArrayType(FieldType):
     @property
     def public_type(self) -> str:
         return self.element_type.public_type
-
-    @property
-    def float_factor(self) -> int:
-        return self.element_type.float_factor
 
     @cached_property
     def array_sizes(self) -> "tuple[ArraySize]":
@@ -700,7 +766,7 @@ if (!differ) {{
 
     def _put_all(self, index: str, inner_put: str) -> str:
         inner_put = prefix("    ", inner_put)
-        return """
+        return """\
 {{
   int {index};
 
@@ -731,7 +797,7 @@ if (!differ) {{
     def _put_diff(self, index: str, inner_put: str, inner_cmp: str) -> str:
         inner_put = prefix("      ", inner_put)
         inner_cmp = prefix("    ", inner_cmp)
-        return """
+        return """\
 {{
   int {index};
 
@@ -819,6 +885,110 @@ if (!differ) {{
         else:
             return self._put_all(index, inner_put)
 
+    def _get_all(self, index: str, inner_get: str, name: str) -> str:
+        inner_get = prefix("    ", inner_get)
+        size_check = prefix("  ", self.size.get_size_check(name))
+        return """\
+{{
+  int {index};
+
+#ifdef FREECIV_JSON_CONNECTION
+  /* Enter array. */
+  field_addr.sub_location = plocation_elem_new(0);
+#endif /* FREECIV_JSON_CONNECTION */
+
+{size_check}\
+  for ({index} = 0; {index} < {self.size.real}; {index}++) {{
+#ifdef FREECIV_JSON_CONNECTION
+    field_addr.sub_location->number = {index};
+#endif /* FREECIV_JSON_CONNECTION */
+{inner_get}\
+  }}
+
+#ifdef FREECIV_JSON_CONNECTION
+  /* Exit array. */
+  free(field_addr.sub_location);
+  field_addr.sub_location = NULL;
+#endif /* FREECIV_JSON_CONNECTION */
+}}
+""".format(self = self, index = index, inner_get = inner_get, size_check = size_check)
+
+    def _get_diff(self, index: str, inner_get: str, name: str) -> str:
+        inner_get = prefix("    ", inner_get)
+        return """\
+{{
+#ifdef FREECIV_JSON_CONNECTION
+  int count;
+
+  /* Enter array. */
+  field_addr.sub_location = plocation_elem_new(0);
+
+  for (count = 0;; count++) {{
+    int {index};
+
+    field_addr.sub_location->number = count;
+
+    /* Enter diff array element (start at the index address). */
+    field_addr.sub_location->sub_location = plocation_elem_new(0);
+#else /* FREECIV_JSON_CONNECTION */
+  while (TRUE) {{
+    int {index};
+#endif /* FREECIV_JSON_CONNECTION */
+
+    if (!DIO_GET(uint8, &din, &field_addr, &{index})) {{
+      RECEIVE_PACKET_FIELD_ERROR({name});
+    }}
+    if ({index} == 255) {{
+#ifdef FREECIV_JSON_CONNECTION
+      /* Exit diff array element. */
+      free(field_addr.sub_location->sub_location);
+      field_addr.sub_location->sub_location = NULL;
+
+      /* Exit diff array. */
+      free(field_addr.sub_location);
+      field_addr.sub_location = NULL;
+#endif /* FREECIV_JSON_CONNECTION */
+
+      break;
+    }}
+    if (i > {self.size.real}) {{
+      RECEIVE_PACKET_FIELD_ERROR({name},
+                                 \": unexpected value %d \"
+                                 \"(> {self.size.real}) in array diff\",
+                                 {index});
+    }} else {{
+#ifdef FREECIV_JSON_CONNECTION
+      /* Content address. */
+      field_addr.sub_location->sub_location->number = 1;
+#endif /* FREECIV_JSON_CONNECTION */
+{inner_get}\
+    }}
+
+#ifdef FREECIV_JSON_CONNECTION
+    /* Exit diff array element. */
+    free(field_addr.sub_location->sub_location);
+    field_addr.sub_location->sub_location = NULL;
+#endif /* FREECIV_JSON_CONNECTION */
+  }}
+
+#ifdef FREECIV_JSON_CONNECTION
+  /* Exit array. */
+  free(field_addr.sub_location);
+  field_addr.sub_location = NULL;
+#endif /* FREECIV_JSON_CONNECTION */
+}}
+""".format(self = self, index = index, inner_get = inner_get, name = name)
+
+    def get_get(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
+        index = self._index(depth)
+        inner_name = "%s[%s]" % (name, index)
+
+        inner_get = self.element_type.get_get(inner_name, array_diff, depth + 1)
+
+        if array_diff:
+            return self._get_diff(index, inner_get, name)
+        else:
+            return self._get_all(index, inner_get, name)
 
 class FieldFlagInfo:
     """Flag info for a field in a packet. Multiple fields declared on the
@@ -922,78 +1092,6 @@ class Field:
         self.flags = flaginfo
 
     @property
-    def array_info(self) -> "tuple[ArraySize, ...]":
-        return self.type.array_sizes
-
-    @property
-    def is_array(self) -> int:
-        """Number of array dimensions"""
-        return len(self.array_info)
-
-    @property
-    def _array_size(self) -> ArraySize:
-        """Array size information of the only array dimension"""
-        assert self.is_array == 1
-        return self.array_info[0]
-
-    @property
-    def array_size_d(self) -> str:
-        """Maximum / declared size of the only array dimension"""
-        return self._array_size.max_length
-
-    @property
-    def array_size_u(self) -> str:
-        """Current actual size of the only array dimension"""
-        return self._array_size.real
-
-    @property
-    def array_size_o(self) -> str:
-        """Old actual size of the only array dimension"""
-        return self._array_size.old
-
-    @property
-    def _array_size1(self) -> ArraySize:
-        """Array size information of the first of two array dimensions"""
-        assert self.is_array == 2
-        return self.array_info[0]
-
-    @property
-    def array_size1_d(self) -> str:
-        """Maximum / declared size of the first of two array dimensions"""
-        return self._array_size1.max_length
-
-    @property
-    def array_size1_u(self) -> str:
-        """Current actual size of the first of two array dimensions"""
-        return self._array_size1.real
-
-    @property
-    def array_size1_o(self) -> str:
-        """Old actual size of the first of two array dimensions"""
-        return self._array_size1.old
-
-    @property
-    def _array_size2(self) -> ArraySize:
-        """Array size information of the second of two array dimensions"""
-        assert self.is_array == 2
-        return self.array_info[1]
-
-    @property
-    def array_size2_d(self) -> str:
-        """Maximum / declared size of the second of two array dimensions"""
-        return self._array_size2.max_length
-
-    @property
-    def array_size2_u(self) -> str:
-        """Current actual size of the second of two array dimensions"""
-        return self._array_size2.real
-
-    @property
-    def array_size2_o(self) -> str:
-        """Old actual size of the second of two array dimensions"""
-        return self._array_size2.old
-
-    @property
     def dataio_type(self) -> str:
         """The type used to transmit this field
 
@@ -1004,20 +1102,8 @@ class Field:
     def struct_type(self) -> str:
         """The type used for this field in the packet struct
 
-        See FieldType.struct_type"""
+        See FieldType.public_type"""
         return self.type.public_type
-
-    @property
-    def float_factor(self) -> int:
-        """The float factor, if this field is a float
-
-        See FieldType.float_factor"""
-        return self.type.float_factor
-
-    @property
-    def is_struct(self) -> bool:
-        """Whether the base type of this field is a struct"""
-        return self.struct_type.startswith("struct")
 
     @property
     def is_key(self) -> bool:
@@ -1164,15 +1250,17 @@ field_addr.name = \"{self.name}\";
     def get_get_wrapper(self, packet: "Variant", i: int, deltafragment: bool) -> str:
         if self.folded_into_head:
             assert isinstance(self.type, BoolType), repr(self.type)
-            return  "  real_packet->{self.name} = BV_ISSET(fields, {i:d});\n".format(self = self, i = i)
-        get = prefix("    ", self.get_get(deltafragment))
+            return  "real_packet->{self.name} = BV_ISSET(fields, {i:d});\n".format(self = self, i = i)
+        get = prefix("  ", self.get_get(deltafragment))
         if packet.gen_log:
-            f = "    {packet.log_macro}(\"  got field '{self.name}'\");\n".format(self = self, packet = packet)
+            f = "  {packet.log_macro}(\"  got field '{self.name}'\");\n".format(self = self, packet = packet)
         else:
             f=""
-        return """  if (BV_ISSET(fields, {i:d})) {{
-{f}{get}
-  }}
+        return """\
+if (BV_ISSET(fields, {i:d})) {{
+{f}\
+{get}\
+}}
 """.format(i = i, f = f, get = get)
 
     # Returns code which get this field.
@@ -1182,275 +1270,11 @@ field_addr.name = \"{self.name}\";
 field_addr.name = \"{self.name}\";
 #endif /* FREECIV_JSON_CONNECTION */
 """.format(self = self) \
-               + self.get_get_real(deltafragment);
+               + self.get_get_real(deltafragment)
 
     # The code which get this field before it is wrapped in address adding.
     def get_get_real(self, deltafragment: bool) -> str:
-        if isinstance(self.type, FloatType):
-            return """\
-if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}, {self.float_factor:d})) {{
-  RECEIVE_PACKET_FIELD_ERROR({self.name});
-}}""".format(self = self)
-
-        if isinstance(self.type, BitvectorType):
-            return """\
-if (!DIO_BV_GET(&din, &field_addr, real_packet->{self.name})) {{
-  RECEIVE_PACKET_FIELD_ERROR({self.name});
-}}""".format(self = self)
-
-        if isinstance(self.type, (StringType, CityMapType)):
-            return """\
-if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}, sizeof(real_packet->{self.name}))) {{
-  RECEIVE_PACKET_FIELD_ERROR({self.name});
-}}""".format(self = self)
-
-        if isinstance(self.type, StructType):
-            return """\
-if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
-  RECEIVE_PACKET_FIELD_ERROR({self.name});
-}}""".format(self = self)
-
-        if isinstance(self.type, (IntType, BoolType)):
-            return """\
-if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name})) {{
-  RECEIVE_PACKET_FIELD_ERROR({self.name});
-}}""".format(self = self)
-
-        if isinstance(self.type, BasicType):
-            return """\
-{{
-  int readin;
-
-  if (!DIO_GET({self.dataio_type}, &din, &field_addr, &readin)) {{
-    RECEIVE_PACKET_FIELD_ERROR({self.name});
-  }}
-  real_packet->{self.name} = readin;
-}}""".format(self = self)
-
-        assert isinstance(self.type, (ArrayType, MemoryType)), repr(self.type)
-
-        if self.is_struct:
-            assert not isinstance(self.type, MemoryType), repr(self.type)
-            if self.is_array==2:
-                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
-                assert isinstance(self.type.element_type.element_type, StructType), repr(self.type.element_type.element_type)
-                c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i][j])) {{
-      RECEIVE_PACKET_FIELD_ERROR({self.name});
-    }}""".format(self = self)
-            else:
-                assert isinstance(self.type.element_type, StructType), repr(self.type.element_type)
-                c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i])) {{
-      RECEIVE_PACKET_FIELD_ERROR({self.name});
-    }}""".format(self = self)
-        elif self.dataio_type=="string" or self.dataio_type=="estring":
-            assert not isinstance(self.type, MemoryType), repr(self.type)
-            assert isinstance(self.type.element_type, StringType), repr(self.type.element_type)
-            c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}[i], sizeof(real_packet->{self.name}[i]))) {{
-      RECEIVE_PACKET_FIELD_ERROR({self.name});
-    }}""".format(self = self)
-        elif self.struct_type=="float":
-            assert not isinstance(self.type, MemoryType), repr(self.type)
-            if self.is_array==2:
-                assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
-                assert isinstance(self.type.element_type.element_type, FloatType), repr(self.type.element_type.element_type)
-                c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i][j], {self.float_factor:d})) {{
-      RECEIVE_PACKET_FIELD_ERROR({self.name});
-    }}""".format(self = self)
-            else:
-                assert isinstance(self.type.element_type, FloatType), repr(self.type.element_type)
-                c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i], {self.float_factor:d})) {{
-      RECEIVE_PACKET_FIELD_ERROR({self.name});
-    }}""".format(self = self)
-        elif self.is_array==2:
-            assert not isinstance(self.type, MemoryType), repr(self.type)
-            assert isinstance(self.type.element_type, ArrayType), repr(self.type.element_type)
-            if self.struct_type in ["int","bool"]:
-                assert isinstance(self.type.element_type.element_type, (IntType, BoolType)), repr(self.type.element_type.element_type)
-                c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i][j])) {{
-      RECEIVE_PACKET_FIELD_ERROR({self.name});
-    }}""".format(self = self)
-            else:
-                assert type(self.type.element_type.element_type) is BasicType, repr(self.type.element_type.element_type)
-                c = """{{
-      int readin;
-
-      if (!DIO_GET({self.dataio_type}, &din, &field_addr, &readin)) {{
-        RECEIVE_PACKET_FIELD_ERROR({self.name});
-      }}
-      real_packet->{self.name}[i][j] = readin;
-    }}""".format(self = self)
-        elif self.struct_type in ["int","bool"]:
-            assert not isinstance(self.type, MemoryType), repr(self.type)
-            assert isinstance(self.type.element_type, (IntType, BoolType)), repr(self.type.element_type)
-            c = """if (!DIO_GET({self.dataio_type}, &din, &field_addr, &real_packet->{self.name}[i])) {{
-      RECEIVE_PACKET_FIELD_ERROR({self.name});
-    }}""".format(self = self)
-        else:
-            assert isinstance(self.type, MemoryType) or type(self.type.element_type) is BasicType, repr(self.type.element_type)
-            c = """{{
-      int readin;
-
-      if (!DIO_GET({self.dataio_type}, &din, &field_addr, &readin)) {{
-        RECEIVE_PACKET_FIELD_ERROR({self.name});
-      }}
-      real_packet->{self.name}[i] = readin;
-    }}""".format(self = self)
-
-        if self.is_array==2:
-            array_size_u=self.array_size1_u
-            array_size_d=self.array_size1_d
-        else:
-            array_size_u=self.array_size_u
-            array_size_d=self.array_size_d
-
-        if not self.diff or isinstance(self.type, MemoryType):
-            if array_size_u != array_size_d:
-                extra = """
-  if ({array_size_u} > {array_size_d}) {{
-    RECEIVE_PACKET_FIELD_ERROR({self.name}, ": truncation array");
-  }}""".format(self = self, array_size_u = array_size_u, array_size_d = array_size_d)
-            else:
-                extra=""
-            if isinstance(self.type, MemoryType):
-                return """{extra}
-  if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{self.name}, {array_size_u})) {{
-    RECEIVE_PACKET_FIELD_ERROR({self.name});
-  }}""".format(self = self, array_size_u = array_size_u, extra = extra)
-            elif isinstance(self.type.element_type, ArrayType):
-                return """
-{{
-  int i, j;
-
-#ifdef FREECIV_JSON_CONNECTION
-  /* Enter outer array. */
-  field_addr.sub_location = plocation_elem_new(0);
-#endif /* FREECIV_JSON_CONNECTION */
-{extra}
-  for (i = 0; i < {self.array_size1_u}; i++) {{
-#ifdef FREECIV_JSON_CONNECTION
-    /* Update address of outer array element (inner array). */
-    field_addr.sub_location->number = i;
-
-    /* Enter inner array. */
-    field_addr.sub_location->sub_location = plocation_elem_new(0);
-#endif /* FREECIV_JSON_CONNECTION */
-    for (j = 0; j < {self.array_size2_u}; j++) {{
-#ifdef FREECIV_JSON_CONNECTION
-      /* Update address of element in inner array. */
-      field_addr.sub_location->sub_location->number = j;
-#endif /* FREECIV_JSON_CONNECTION */
-      {c}
-    }}
-
-#ifdef FREECIV_JSON_CONNECTION
-    /* Exit inner array. */
-    free(field_addr.sub_location->sub_location);
-    field_addr.sub_location->sub_location = NULL;
-#endif /* FREECIV_JSON_CONNECTION */
-  }}
-
-#ifdef FREECIV_JSON_CONNECTION
-  /* Exit outer array. */
-  free(field_addr.sub_location);
-  field_addr.sub_location = NULL;
-#endif /* FREECIV_JSON_CONNECTION */
-}}""".format(self = self, c = c, extra = extra)
-            else:
-                return """
-{{
-  int i;
-
-#ifdef FREECIV_JSON_CONNECTION
-  /* Enter array. */
-  field_addr.sub_location = plocation_elem_new(0);
-#endif /* FREECIV_JSON_CONNECTION */
-{extra}
-  for (i = 0; i < {array_size_u}; i++) {{
-#ifdef FREECIV_JSON_CONNECTION
-    field_addr.sub_location->number = i;
-#endif /* FREECIV_JSON_CONNECTION */
-    {c}
-  }}
-
-#ifdef FREECIV_JSON_CONNECTION
-  /* Exit array. */
-  free(field_addr.sub_location);
-  field_addr.sub_location = NULL;
-#endif /* FREECIV_JSON_CONNECTION */
-}}""".format(array_size_u = array_size_u, c = c, extra = extra)
-        elif deltafragment and self.diff and not isinstance(self.type.element_type, (ArrayType, StringType)):
-            return """
-{{
-#ifdef FREECIV_JSON_CONNECTION
-int count;
-
-/* Enter array. */
-field_addr.sub_location = plocation_elem_new(0);
-
-for (count = 0;; count++) {{
-  int i;
-
-  field_addr.sub_location->number = count;
-
-  /* Enter diff array element (start at the index address). */
-  field_addr.sub_location->sub_location = plocation_elem_new(0);
-#else /* FREECIV_JSON_CONNECTION */
-while (TRUE) {{
-  int i;
-#endif /* FREECIV_JSON_CONNECTION */
-
-  if (!DIO_GET(uint8, &din, &field_addr, &i)) {{
-    RECEIVE_PACKET_FIELD_ERROR({self.name});
-  }}
-  if (i == 255) {{
-#ifdef FREECIV_JSON_CONNECTION
-    /* Exit diff array element. */
-    free(field_addr.sub_location->sub_location);
-    field_addr.sub_location->sub_location = NULL;
-
-    /* Exit diff array. */
-    free(field_addr.sub_location);
-    field_addr.sub_location = NULL;
-#endif /* FREECIV_JSON_CONNECTION */
-
-    break;
-  }}
-  if (i > {array_size_u}) {{
-    RECEIVE_PACKET_FIELD_ERROR({self.name},
-                               \": unexpected value %d \"
-                               \"(> {array_size_u}) in array diff\",
-                               i);
-  }} else {{
-#ifdef FREECIV_JSON_CONNECTION
-    /* Content address. */
-    field_addr.sub_location->sub_location->number = 1;
-#endif /* FREECIV_JSON_CONNECTION */
-    {c}
-  }}
-
-#ifdef FREECIV_JSON_CONNECTION
-  /* Exit diff array element. */
-  free(field_addr.sub_location->sub_location);
-  field_addr.sub_location->sub_location = NULL;
-#endif /* FREECIV_JSON_CONNECTION */
-}}
-
-#ifdef FREECIV_JSON_CONNECTION
-/* Exit array. */
-free(field_addr.sub_location);
-field_addr.sub_location = NULL;
-#endif /* FREECIV_JSON_CONNECTION */
-}}""".format(self = self, array_size_u = array_size_u, c = c)
-        else:
-            assert not isinstance(self.type.element_type, (ArrayType, StringType)), repr(self.type.element_type)
-            return """
-{{
-  int i;
-
-  for (i = 0; i < {array_size_u}; i++) {{
-    {c}
-  }}
-}}""".format(array_size_u = array_size_u, c = c)
+        return self.type.get_get(self.name, deltafragment and self.diff)
 
 
 # Class which represents a capability variant.
@@ -1917,7 +1741,7 @@ static char *stats_{self.name}_names[] = {{{names}}};
   DIO_BV_GET(&din, &field_addr, fields);
 '''
             body1 = "".join(
-                prefix("  ", field.get_get(True)) + "\n"
+                prefix("  ", field.get_get(True))
                 for field in self.key_fields
             )
             body1=body1+"\n#else /* FREECIV_DELTA_PROTOCOL */\n"
@@ -1928,7 +1752,7 @@ static char *stats_{self.name}_names[] = {{{names}}};
             body1="#if 1 /* To match endif */\n"
             body2=""
         nondelta = "".join(
-            prefix("  ", field.get_get(False)) + "\n"
+            prefix("  ", field.get_get(False))
             for field in self.fields
         ) or "  real_packet->__dummy = 0xff;"
         body1=body1+nondelta+"\n#endif\n"
@@ -2011,7 +1835,7 @@ static char *stats_{self.name}_names[] = {{{names}}};
 
 """.format(self = self, key1 = key1, key2 = key2, fl = fl)
         body += "".join(
-            field.get_get_wrapper(self, i, True)
+            prefix("  ", field.get_get_wrapper(self, i, True))
             for i, field in enumerate(self.other_fields)
         )
 
