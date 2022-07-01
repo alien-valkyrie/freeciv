@@ -27,24 +27,27 @@ from abc import ABC, abstractmethod
 import typing
 T_co = typing.TypeVar("T_co", covariant = True)
 
-try:
+if typing.TYPE_CHECKING:
     from functools import cached_property
-except ImportError:
-    class cached_property:
-        """Simplified backport of Python 3.8's functools.cached_property
-        with fewer checks and safeguards. Not thread-safe."""
+else:
+    try:
+        from functools import cached_property
+    except ImportError:
+        class cached_property:
+            """Simplified backport of Python 3.8's functools.cached_property
+            with fewer checks and safeguards. Not thread-safe."""
 
-        def __init__(self, func):
-            self.func = func
+            def __init__(self, func):
+                self.func = func
 
-        def __get__(self, instance, owner=None):
-            if instance is None:
-                return self
-            d = instance.__dict__
-            name = self.func.__name__
-            if name not in d:
-                d[name] = self.func(instance)
-            return d[name]
+            def __get__(self, instance, owner=None):
+                if instance is None:
+                    return self
+                d = instance.__dict__
+                name = self.func.__name__
+                if name not in d:
+                    d[name] = self.func(instance)
+                return d[name]
 
 
 ###################### Parsing Command Line Arguments ######################
@@ -179,7 +182,7 @@ def verbose(s):
 ####################### File access helper functions #######################
 
 def write_disclaimer(f: typing.TextIO):
-    f.write('''
+    f.write("""\
  /****************************************************************************
  *                       THIS FILE WAS GENERATED                             *
  * Script: common/generate_packets.py                                        *
@@ -187,7 +190,7 @@ def write_disclaimer(f: typing.TextIO):
  *                       DO NOT CHANGE THIS FILE                             *
  ****************************************************************************/
 
-''')
+""")
 
 @contextmanager
 def wrap_header(file: typing.TextIO, header_name: str, cplusplus: bool = True) -> typing.Iterator[None]:
@@ -298,44 +301,67 @@ def prefix(prefix: str, text: str) -> str:
 
 ############################ Field type classes ############################
 
-class ArraySize:
+# Notes for the proper implementation (or the next prototype):
+# - consider kicking out some unused types (city map, cm param)?
+#   or at least test that they still produce compilable code
+# - remove some legacy restrictions that *should* work now, like arrays of
+#   various types that weren't previously possible (e.g. bitvectors)
+# - type should probably be chosen entirely based on dataio type, not public
+#   type ~> technically a semantic change in some hypothetical cases; those
+#   cases *probably* don't actually occur in practice (and wouldn't work if
+#   they did)
+# - handling get code for dataio type = int != public type: this is done in
+#   BasicType here, which is probably a bad idea ~> should probably be done
+#   in IntType (and BoolType?), in accordace with above note
+# - IntType and BoolType are currently essentially identical ~> either see
+#   about merging them (and deciding folded_into_head based on dataio or
+#   public type again), or making them more different (e.g. by moving
+#   foldability into the type)
+# - there are plenty more things that could be moved into types; special
+#   call-by-reference handling of worklists; stuff involving key fields;
+#   in short: anything still using Field.dataio_type and Field.struct_type
+# - maybe figure out how more than 3 array indices should be generated
+#   ~> i, j, k, i_3, i_4, i_5, ...?
+#   ~> i, j, k, ii, jj, kk, iii, ...?
+#   ~> i, j, k, ii, ij, ik, ji, jj, jk, ...?
+
+class SizeInfo:
     """Information about the size of an array dimension"""
 
-    def __init__(self, max_length: str, actual_length: "str | None" = None):
-        self.max_length = max_length
+    def __init__(self, declared: str, actual_length: "str | None" = None):
+        self.declared = declared
         self._actual_length = actual_length
 
     @property
     def real(self) -> str:
         if self._actual_length is None:
-            return self.max_length
+            return self.declared
         return "real_packet->" + self._actual_length
 
     @property
     def old(self) -> str:
         if self._actual_length is None:
-            return self.max_length
+            return self.declared
         return "old->" + self._actual_length
 
     def __str__(self) -> str:
         if self._actual_length is None:
-            return self.max_length
+            return self.declared
         else:
-            return "%s:%s" % (self.max_length, self._actual_length)
+            return "%s:%s" % (self.declared, self._actual_length)
 
-    
     def get_size_check(self, name: str) -> str:
         if self._actual_length is None:
             return ""
         return """\
-if ({self.real} > {self.max_length}) {{
+if ({self.real} > {self.declared}) {{
   RECEIVE_PACKET_FIELD_ERROR({name}, ": truncation array");
 }}
 """.format(self = self, name = name)
 
 
     @classmethod
-    def parse(cls, size_text: str) -> "ArraySize":
+    def parse(cls, size_text: str) -> "SizeInfo":
         parts = size_text.split(":")
         if len(parts) > 2:
             raise ValueError("Invalid array size declaration: %r" % size_text)
@@ -388,7 +414,7 @@ class PreType(ABC):
         return BasicType(dataio_type, public_type)
 
     @abstractmethod
-    def array(self, size: ArraySize) -> "FieldType":
+    def array(self, size: SizeInfo) -> "FieldType":
         raise NotImplementedError
 
     @abstractmethod
@@ -402,12 +428,12 @@ class NeedSizeType(PreType):
     """Pre-types that require one size to become a real type"""
 
     def __init__(self, dataio_type: str, public_type: str,
-                 cls: "typing.Callable[[str, str, ArraySize], FieldType]"):
+                 cls: "typing.Callable[[str, str, SizeInfo], FieldType]"):
         self.dataio_type = dataio_type
         self.public_type = public_type
         self.cls = cls
 
-    def array(self, size: ArraySize) -> "FieldType":
+    def array(self, size: SizeInfo) -> "FieldType":
         return self.cls(self.dataio_type, self.public_type, size)
 
     def __str__(self) -> str:
@@ -416,8 +442,6 @@ class NeedSizeType(PreType):
 
 class FieldType(PreType):
     """Abstract base class (ABC) for different field types"""
-
-    array_sizes = ()
 
     @abstractmethod
     def __init__(self):
@@ -428,7 +452,7 @@ class FieldType(PreType):
         if self.public_type != req:
             raise ValueError("{self.dataio_type} type {self} must have public type '{req}'".format(self = self, req = req))
 
-    def array(self, size: ArraySize) -> "FieldType":
+    def array(self, size: SizeInfo) -> "FieldType":
         return ArrayType(self, size)
 
     @abstractmethod
@@ -466,14 +490,18 @@ class BasicType(FieldType):
         return "%s(%s)" % (self.dataio_type, self.public_type)
 
     def get_declaration(self, name: str) -> str:
-        return "%s %s" % (self.public_type, name)
+        return """\
+%s %s;
+""" % (self.public_type, name)
 
     @property
     def handle_type(self) -> str:
         return self.public_type + " "
 
     def get_fill(self, name: str, depth: int = 0) -> str:
-        return "real_packet->{name} = {name};".format(name = name)
+        return """\
+real_packet->{name} = {name};
+""".format(name = name)
 
     def get_cmp(self, name: str, depth: int = 0) -> str:
         return """\
@@ -544,7 +572,7 @@ class BitvectorType(BasicType):
         super().__init__(dataio_type, public_type)
         assert self.dataio_type == "bitvector", repr(self)
 
-    def array(self, size: ArraySize) -> "FieldType":
+    def array(self, size: SizeInfo) -> "FieldType":
         raise ValueError("bitvector arrays not supported")
 
     def get_cmp(self, name: str, depth: int = 0) -> str:
@@ -592,7 +620,7 @@ class WorklistType(StructType):
         assert self.dataio_type == "worklist", repr(self)
         self._require_public("struct worklist")
 
-    def array(self, size: ArraySize) -> "FieldType":
+    def array(self, size: SizeInfo) -> "FieldType":
         raise ValueError("worklist arrays not supported")
 
     @property
@@ -600,7 +628,9 @@ class WorklistType(StructType):
         return "const %s*" % super().handle_type
 
     def get_fill(self, name: str, depth: int = 0) -> str:
-        return "worklist_copy(&real_packet->{name}, {name});".format(name = name)
+        return """\
+worklist_copy(&real_packet->{name}, {name});
+""".format(name = name)
 
 class CMParamType(StructType):
     def __init__(self, dataio_type: str, public_type: str):
@@ -608,7 +638,7 @@ class CMParamType(StructType):
         assert self.dataio_type == "cm_parameter", repr(self)
         self._require_public("struct cm_parameter")
 
-    def array(self, size: ArraySize) -> "FieldType":
+    def array(self, size: SizeInfo) -> "FieldType":
         raise ValueError("cm_parameter arrays not supported")
 
     def get_cmp(self, name: str, depth: int = 0) -> str:
@@ -619,20 +649,18 @@ differ = !cm_are_parameter_equal(&old->{name}, &real_packet->{name});
 class OneSizeType(FieldType):
     """Base class for types that require one array dimension to be useable"""
 
-    def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
+    def __init__(self, dataio_type: str, public_type: str, size: SizeInfo):
         self.dataio_type = dataio_type
         self.public_type = public_type
         self.size = size
-
-    @cached_property
-    def array_sizes(self) -> "tuple[ArraySize]":
-        return (self.size,)
 
     def __str__(self) -> str:
         return "%s(%s)[%s]" % (self.dataio_type, self.public_type, self.size)
 
     def get_declaration(self, name: str) -> str:
-        return "%s %s[%s]" % (self.public_type, name, self.size.max_length)
+        return """\
+%s %s[%s];
+""" % (self.public_type, name, self.size.declared)
 
     @property
     def handle_type(self) -> str:
@@ -646,13 +674,15 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{name}, sizeof(
 """.format(self = self, name = name)
 
 class StringType(OneSizeType):
-    def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
+    def __init__(self, dataio_type: str, public_type: str, size: SizeInfo):
         super().__init__(dataio_type, public_type, size)
         assert self.dataio_type in ("string", "estring"), repr(self)
         self._require_public("char")
 
     def get_fill(self, name: str, depth: int = 0) -> str:
-        return "sz_strlcpy(real_packet->{name}, {name});".format(name = name)
+        return """\
+sz_strlcpy(real_packet->{name}, {name});
+""".format(name = name)
 
     def get_cmp(self, name: str, depth: int = 0) -> str:
         return """\
@@ -660,7 +690,7 @@ differ = (strcmp(old->{name}, real_packet->{name}) != 0);
 """.format(name = name)
 
 class MemoryType(OneSizeType):
-    def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
+    def __init__(self, dataio_type: str, public_type: str, size: SizeInfo):
         super().__init__(dataio_type, public_type, size)
         assert self.dataio_type == "memory", repr(self)
         self._require_public("unsigned char")
@@ -670,7 +700,7 @@ class MemoryType(OneSizeType):
 
     def get_cmp(self, name: str, depth: int = 0) -> str:
         return """\
-differ = (memcmp(old->{name}, real_packet->{name}, {self.size.max_length}) != 0);
+differ = (memcmp(old->{name}, real_packet->{name}, {self.size.declared}) != 0);
 """.format(self = self, name = name)
 
     def get_put(self, name: str, array_diff: bool = False, depth: int = 0) -> str:
@@ -688,7 +718,7 @@ if (!DIO_GET({self.dataio_type}, &din, &field_addr, real_packet->{name}, {self.s
 """.format(self = self, name = name, size_check = size_check)
 
 class CityMapType(OneSizeType):
-    def __init__(self, dataio_type: str, public_type: str, size: ArraySize):
+    def __init__(self, dataio_type: str, public_type: str, size: SizeInfo):
         super().__init__(dataio_type, public_type, size)
         assert self.dataio_type == "city_map", repr(self)
         self._require_public("char")
@@ -702,7 +732,7 @@ class CityMapType(OneSizeType):
 class ArrayType(FieldType):
     INDICES = "ijk"
 
-    def __init__(self, element_type: FieldType, size: ArraySize):
+    def __init__(self, element_type: FieldType, size: SizeInfo):
         self.element_type = element_type
         self.size = size
 
@@ -714,10 +744,6 @@ class ArrayType(FieldType):
     def public_type(self) -> str:
         return self.element_type.public_type
 
-    @cached_property
-    def array_sizes(self) -> "tuple[ArraySize]":
-        return (self.size,) + self.element_type.array_sizes
-
     def __str__(self) -> str:
         return "%s[%s]" % (self.element_type, self.size)
 
@@ -727,7 +753,7 @@ class ArrayType(FieldType):
         return self.INDICES[depth]
 
     def get_declaration(self, name: str) -> str:
-        return self.element_type.get_declaration("%s[%s]" % (name, self.size.max_length))
+        return self.element_type.get_declaration("%s[%s]" % (name, self.size.declared))
 
     @property
     def handle_type(self) -> str:
@@ -741,9 +767,10 @@ class ArrayType(FieldType):
   int i;
 
   for (i = 0; i < {self.size.real}; i++) {{
-{inner_fill}
+{inner_fill}\
   }}
-}}""".format(self = self, inner_fill = inner_fill)
+}}
+""".format(self = self, inner_fill = inner_fill)
 
     def get_cmp(self, name: str, depth: int = 0) -> str:
         index = self._index(depth)
@@ -990,7 +1017,7 @@ if (!differ) {{
         else:
             return self._get_all(index, inner_get, name)
 
-class FieldFlagInfo:
+class FlagInfo:
     """Flag info for a field in a packet. Multiple fields declared on the
     same line will share the same flag info object."""
 
@@ -1000,7 +1027,7 @@ class FieldFlagInfo:
     REMOVE_CAP_PATTERN = re.compile(r"^remove-cap\((.*)\)$")
 
     @classmethod
-    def parse(cls, text: str) -> "FieldFlagInfo":
+    def parse(cls, text: str) -> "FlagInfo":
         return cls(
             stripped
             for flag in text.split(",")
@@ -1066,7 +1093,7 @@ class Field:
             types[type_text] = FieldType.parse(type_text)
         typeinfo = types[type_text]
 
-        flaginfo = FieldFlagInfo.parse(flags)
+        flaginfo = FlagInfo.parse(flags)
 
         # analyze fields
         for field_text in fields.split(","):
@@ -1078,7 +1105,7 @@ class Field:
             mo = cls.ARRAY_PATTERN.fullmatch(field_text)
             while mo is not None:
                 field_text = mo.group(1)
-                field_type = field_type.array(ArraySize.parse(mo.group(2)))
+                field_type = field_type.array(SizeInfo.parse(mo.group(2)))
                 mo = cls.ARRAY_PATTERN.fullmatch(field_text)
 
             if not isinstance(field_type, FieldType):
@@ -1086,7 +1113,7 @@ class Field:
 
             yield cls(field_text, field_type, flaginfo)
 
-    def __init__(self, name: str, typeinfo: FieldType, flaginfo: FieldFlagInfo):
+    def __init__(self, name: str, typeinfo: FieldType, flaginfo: FlagInfo):
         self.name = name
         self.type = typeinfo
         self.flags = flaginfo
@@ -1125,7 +1152,7 @@ class Field:
         """Set of all forbidden capabilities for this field"""
         return self.flags.remove_caps
 
-    @property
+    @cached_property
     def caps(self) -> typing.AbstractSet[str]:
         """All capabilities affecting this field"""
         return self.add_caps | self.remove_caps
@@ -1149,9 +1176,9 @@ class Field:
     # Returns code which copies the arguments of the direct send
     # functions in the packet struct.
     def get_fill(self) -> str:
-        return prefix("  ", self.type.get_fill(self.name))
+        return self.type.get_fill(self.name)
 
-    @property
+    @cached_property
     def cmp_code(self) -> str:
         """Code which sets 'differ' according to whether the field changed
         betwen 'old' and 'real_packet'"""
@@ -1250,10 +1277,14 @@ field_addr.name = \"{self.name}\";
     def get_get_wrapper(self, packet: "Variant", i: int, deltafragment: bool) -> str:
         if self.folded_into_head:
             assert isinstance(self.type, BoolType), repr(self.type)
-            return  "real_packet->{self.name} = BV_ISSET(fields, {i:d});\n".format(self = self, i = i)
+            return """\
+real_packet->{self.name} = BV_ISSET(fields, {i:d});
+""".format(self = self, i = i)
         get = prefix("  ", self.get_get(deltafragment))
         if packet.gen_log:
-            f = "  {packet.log_macro}(\"  got field '{self.name}'\");\n".format(self = self, packet = packet)
+            f = """\
+  {packet.log_macro}(\"  got field '{self.name}'\");
+""".format(self = self, packet = packet)
         else:
             f=""
         return """\
@@ -1346,13 +1377,13 @@ class Variant:
         return self.packet.is_info
 
     @property
-    def cancel(self) -> "list[str]":
+    def cancel(self) -> typing.Sequence[str]:
         """List of packets to cancel when sending or receiving this packet
 
         See Packet.cancel"""
         return self.packet.cancel
 
-    @property
+    @cached_property
     def differ_used(self) -> bool:
         """Whether the send function needs a `differ` boolean.
 
@@ -1369,7 +1400,7 @@ class Variant:
             )
         )
 
-    @property
+    @cached_property
     def condition(self) -> str:
         """The condition determining whether this variant should be used,
         based on capabilities.
@@ -1405,18 +1436,26 @@ class Variant:
 
         See get_packet_handlers_fill_capability"""
         if self.no_packet:
-            return "phandlers->send[{self.type}].no_packet = (int(*)(struct connection *)) send_{self.name};".format(self = self)
+            return """\
+phandlers->send[{self.type}].no_packet = (int(*)(struct connection *)) send_{self.name};
+""".format(self = self)
         elif self.want_force:
-            return "phandlers->send[{self.type}].force_to_send = (int(*)(struct connection *, const void *, bool)) send_{self.name};".format(self = self)
+            return """\
+phandlers->send[{self.type}].force_to_send = (int(*)(struct connection *, const void *, bool)) send_{self.name};
+""".format(self = self)
         else:
-            return "phandlers->send[{self.type}].packet = (int(*)(struct connection *, const void *)) send_{self.name};".format(self = self)
+            return """\
+phandlers->send[{self.type}].packet = (int(*)(struct connection *, const void *)) send_{self.name};
+""".format(self = self)
 
     @property
     def receive_handler(self) -> str:
         """Code to set the receive handler for this variant
 
         See get_packet_handlers_fill_capability"""
-        return "phandlers->receive[{self.type}] = (void *(*)(struct connection *)) receive_{self.name};".format(self = self)
+        return """\
+phandlers->receive[{self.type}] = (void *(*)(struct connection *)) receive_{self.name};
+""".format(self = self)
 
     # Returns a code fragment which contains the declarations of the
     # statistical counters of this packet.
@@ -1426,7 +1465,8 @@ class Variant:
             for field in self.other_fields
         )
 
-        return """static int stats_{self.name}_sent;
+        return """\
+static int stats_{self.name}_sent;
 static int stats_{self.name}_discarded;
 static int stats_{self.name}_counters[{self.bits:d}];
 static char *stats_{self.name}_names[] = {{{names}}};
@@ -1437,48 +1477,57 @@ static char *stats_{self.name}_names[] = {{{names}}};
     # bitvector. Each bit in this bitvector represents one non-key
     # field.
     def get_bitvector(self) -> str:
-        return "BV_DEFINE({self.name}_fields, {self.bits});\n".format(self = self)
+        return """\
+BV_DEFINE({self.name}_fields, {self.bits});
+""".format(self = self)
 
     # Returns a code fragment which is the packet specific part of
     # the delta_stats_report() function.
     def get_report_part(self) -> str:
-        return """
-  if (stats_{self.name}_sent > 0
-      && stats_{self.name}_discarded != stats_{self.name}_sent) {{
-    log_test(\"{self.name} %d out of %d got discarded\",
-      stats_{self.name}_discarded, stats_{self.name}_sent);
-    for (i = 0; i < {self.bits}; i++) {{
-      if (stats_{self.name}_counters[i] > 0) {{
-        log_test(\"  %4d / %4d: %2d = %s\",
-          stats_{self.name}_counters[i],
-          (stats_{self.name}_sent - stats_{self.name}_discarded),
-          i, stats_{self.name}_names[i]);
-      }}
+        return """\
+
+if (stats_{self.name}_sent > 0
+    && stats_{self.name}_discarded != stats_{self.name}_sent) {{
+  log_test(\"{self.name} %d out of %d got discarded\",
+    stats_{self.name}_discarded, stats_{self.name}_sent);
+  for (i = 0; i < {self.bits}; i++) {{
+    if (stats_{self.name}_counters[i] > 0) {{
+      log_test(\"  %4d / %4d: %2d = %s\",
+        stats_{self.name}_counters[i],
+        (stats_{self.name}_sent - stats_{self.name}_discarded),
+        i, stats_{self.name}_names[i]);
     }}
   }}
+}}
 """.format(self = self)
 
     # Returns a code fragment which is the packet specific part of
     # the delta_stats_reset() function.
     def get_reset_part(self) -> str:
-        return """
-  stats_{self.name}_sent = 0;
-  stats_{self.name}_discarded = 0;
-  memset(stats_{self.name}_counters, 0,
-         sizeof(stats_{self.name}_counters));
+        return """\
+
+stats_{self.name}_sent = 0;
+stats_{self.name}_discarded = 0;
+memset(stats_{self.name}_counters, 0,
+       sizeof(stats_{self.name}_counters));
 """.format(self = self)
 
     # Returns a code fragment which is the implementation of the hash
     # function. The hash function is using all key fields.
     def get_hash(self) -> str:
         if len(self.key_fields)==0:
-            return "#define hash_{self.name} hash_const\n\n".format(self = self)
+            return """\
+#define hash_{self.name} hash_const
+
+""".format(self = self)
         else:
-            intro = """static genhash_val_t hash_{self.name}(const void *vkey)
+            intro = """\
+static genhash_val_t hash_{self.name}(const void *vkey)
 {{
 """.format(self = self)
 
-            body = """  const struct {self.packet_name} *key = (const struct {self.packet_name} *) vkey;
+            body = """\
+  const struct {self.packet_name} *key = (const struct {self.packet_name} *) vkey;
 
 """.format(self = self)
 
@@ -1489,8 +1538,13 @@ static char *stats_{self.name}_names[] = {{{names}}};
                 a="({} << 8) ^ {}".format(*keys)
             else:
                 raise ValueError("unsupported number of key fields for %s" % self.name)
-            body=body+('  return %s;\n'%a)
-            extro="}\n\n"
+            body += """\
+  return %s;
+""" % a
+            extro = """\
+}
+
+"""
             return intro+body+extro
 
     # Returns a code fragment which is the implementation of the cmp
@@ -1498,20 +1552,27 @@ static char *stats_{self.name}_names[] = {{{names}}};
     # function is used for the hash table.
     def get_cmp(self) -> str:
         if len(self.key_fields)==0:
-            return "#define cmp_{self.name} cmp_const\n\n".format(self = self)
+            return """\
+#define cmp_{self.name} cmp_const
+
+""".format(self = self)
         else:
-            intro = """static bool cmp_{self.name}(const void *vkey1, const void *vkey2)
+            intro = """\
+static bool cmp_{self.name}(const void *vkey1, const void *vkey2)
 {{
 """.format(self = self)
-            body=""
-            body += """  const struct {self.packet_name} *key1 = (const struct {self.packet_name} *) vkey1;
+            body = """\
+  const struct {self.packet_name} *key1 = (const struct {self.packet_name} *) vkey1;
   const struct {self.packet_name} *key2 = (const struct {self.packet_name} *) vkey2;
 
 """.format(self = self)
             for field in self.key_fields:
-                body += """  return key1->{field.name} == key2->{field.name};
+                body += """\
+  return key1->{field.name} == key2->{field.name};
 """.format(field = field)
-            extro="}\n"
+            extro = """\
+}
+"""
             return intro+body+extro
 
     # Returns a code fragment which is the implementation of the send
@@ -1519,20 +1580,23 @@ static char *stats_{self.name}_names[] = {{{names}}};
     # complex to create.
     def get_send(self) -> str:
         if self.gen_stats:
-            report = """
+            report = """\
+
   stats_total_sent++;
   stats_{self.name}_sent++;
 """.format(self = self)
         else:
             report=""
         if self.gen_log:
-            log = """
+            log = """\
+
   {self.log_macro}("{self.name}: sending info about ({self.keys_format})"{self.keys_arg});
 """.format(self = self)
         else:
             log=""
         if self.packet.want_pre_send:
-            pre1 = """
+            pre1 = """\
+
   {{
     struct {self.packet_name} *tmp = fc_malloc(sizeof(*tmp));
 
@@ -1541,11 +1605,12 @@ static char *stats_{self.name}_names[] = {{{names}}};
     real_packet = tmp;
   }}
 """.format(self = self)
-            pre2='''
+            pre2 = """\
+
   if (real_packet != packet) {
     free((void *) real_packet);
   }
-'''
+"""
         else:
             pre1=""
             pre2=""
@@ -1569,8 +1634,9 @@ static char *stats_{self.name}_names[] = {{{names}}};
   struct {self.packet_name} *old;
 """.format(self = self)
                 if self.differ_used:
-                    delta_header += '''  bool differ;
-'''
+                    delta_header += """\
+  bool differ;
+"""
                 delta_header += """\
   struct genhash **hash = pc->phs.sent + {self.type};
 """.format(self = self)
@@ -1578,18 +1644,25 @@ static char *stats_{self.name}_names[] = {{{names}}};
                     delta_header += """\
   int different = {diff};
 """.format(diff = diff)
-                delta_header += '''#endif /* FREECIV_DELTA_PROTOCOL */
-'''
-                body = self.get_delta_send_body(pre2) + "\n#ifndef FREECIV_DELTA_PROTOCOL"
+                delta_header += """\
+#endif /* FREECIV_DELTA_PROTOCOL */
+"""
+                body = self.get_delta_send_body(pre2) + """\
+#ifndef FREECIV_DELTA_PROTOCOL
+"""
             else:
                 delta_header=""
-                body="#if 1 /* To match endif */"
-            body=body+"\n"
+                body = """\
+#if 1 /* To match endif */
+"""
             body += "".join(
                 prefix("  ", field.get_put(False))
                 for field in self.fields
             )
-            body=body+"\n#endif\n"
+            body += """\
+
+#endif
+"""
         else:
             body=""
             delta_header=""
@@ -1607,7 +1680,8 @@ static char *stats_{self.name}_names[] = {{{names}}};
             post=""
 
         if len(self.fields) != 0:
-            faddr = '''#ifdef FREECIV_JSON_CONNECTION
+            faddr = """\
+#ifdef FREECIV_JSON_CONNECTION
   struct plocation field_addr;
   {
     struct plocation *field_addr_tmp = plocation_field_new(NULL);
@@ -1615,7 +1689,7 @@ static char *stats_{self.name}_names[] = {{{names}}};
     FC_FREE(field_addr_tmp);
   }
 #endif /* FREECIV_JSON_CONNECTION */
-'''
+"""
         else:
             faddr = ""
 
@@ -1645,7 +1719,8 @@ static char *stats_{self.name}_names[] = {{{names}}};
 
     # Helper for get_send()
     def get_delta_send_body(self, before_return: str = "") -> str:
-        intro = """
+        intro = """\
+
 #ifdef FREECIV_DELTA_PROTOCOL
   if (NULL == *hash) {{
     *hash = genhash_new_full(hash_{self.name}, cmp_{self.name},
@@ -1660,10 +1735,12 @@ static char *stats_{self.name}_names[] = {{{names}}};
     memset(old, 0, sizeof(*old));
 """.format(self = self)
         if self.is_info != "no":
-            intro = intro + '''    different = 1;      /* Force to send. */
-'''
-        intro = intro + '''  }
-'''
+            intro += """\
+    different = 1;      /* Force to send. */
+"""
+        intro += """\
+  }
+"""
         body = "".join(
             prefix("  ", field.get_cmp_wrapper(i, self))
             for i, field in enumerate(self.other_fields)
@@ -1688,12 +1765,13 @@ static char *stats_{self.name}_names[] = {{{names}}};
   }}
 """.format(fl = fl, s = s, before_return = before_return)
 
-        body=body+'''
+        body += """\
+
 #ifdef FREECIV_JSON_CONNECTION
   field_addr.name = "fields";
 #endif /* FREECIV_JSON_CONNECTION */
   DIO_BV_PUT(&dout, &field_addr, fields);
-'''
+"""
 
         body += "".join(
             prefix("  ", field.get_put(True))
@@ -1705,19 +1783,25 @@ static char *stats_{self.name}_names[] = {{{names}}};
             prefix("  ", field.get_put_wrapper(self, i, True))
             for i, field in enumerate(self.other_fields)
         )
-        body=body+'''
+
+        body += """\
+
   *old = *real_packet;
-'''
+"""
 
         # Cancel some is-info packets.
         for i in self.cancel:
-            body=body+'''
+            body += """\
+
   hash = pc->phs.sent + %s;
   if (NULL != *hash) {
     genhash_remove(*hash, real_packet);
   }
-'''%i
-        body=body+'''#endif /* FREECIV_DELTA_PROTOCOL */'''
+""" % i
+
+        body += """\
+#endif /* FREECIV_DELTA_PROTOCOL */
+"""
 
         return intro+body
 
@@ -1733,29 +1817,38 @@ static char *stats_{self.name}_names[] = {{{names}}};
   struct genhash **hash = pc->phs.received + {self.type};
 #endif /* FREECIV_DELTA_PROTOCOL */
 """.format(self = self)
-            delta_body1='''
+            delta_body1 = """\
+
 #ifdef FREECIV_DELTA_PROTOCOL
 #ifdef FREECIV_JSON_CONNECTION
   field_addr.name = "fields";
 #endif /* FREECIV_JSON_CONNECTION */
   DIO_BV_GET(&din, &field_addr, fields);
-'''
+"""
             body1 = "".join(
                 prefix("  ", field.get_get(True))
                 for field in self.key_fields
             )
-            body1=body1+"\n#else /* FREECIV_DELTA_PROTOCOL */\n"
+            body1 += """\
+
+#else /* FREECIV_DELTA_PROTOCOL */
+"""
             body2 = self.get_delta_receive_body()
         else:
             delta_header=""
             delta_body1=""
-            body1="#if 1 /* To match endif */\n"
+            body1="""\
+#if 1 /* To match endif */
+"""
             body2=""
         nondelta = "".join(
             prefix("  ", field.get_get(False))
             for field in self.fields
         ) or "  real_packet->__dummy = 0xff;"
-        body1=body1+nondelta+"\n#endif\n"
+        body1 += nondelta + """\
+
+#endif
+"""
 
         if self.gen_log:
             log = """\
@@ -1808,19 +1901,26 @@ static char *stats_{self.name}_names[] = {{{names}}};
 
     # Helper for get_receive()
     def get_delta_receive_body(self) -> str:
-        key1 = map("    {0.struct_type} {0.name} = real_packet->{0.name};".format, self.key_fields)
-        key2 = map("    real_packet->{0.name} = {0.name};".format, self.key_fields)
-        key1="\n".join(key1)
-        key2="\n".join(key2)
-        if key1: key1=key1+"\n\n"
-        if key2: key2="\n\n"+key2
+        save_key = "".join(
+            """\
+    {field.struct_type} {field.name} = real_packet->{field.name};
+""".format(field = field)
+            for field in self.key_fields)
+        if save_key:
+            save_key += "\n"
+
+        restore_key = "".join(prefix("    ", field.get_fill()) for field in self.key_fields)
+        if restore_key:
+            restore_key = "\n" + restore_key
+
         if self.gen_log:
             fl = """\
     {self.log_macro}("  no old info");
 """.format(self = self)
         else:
             fl=""
-        body = """
+        body = """\
+
 #ifdef FREECIV_DELTA_PROTOCOL
   if (NULL == *hash) {{
     *hash = genhash_new_full(hash_{self.name}, cmp_{self.name},
@@ -1830,16 +1930,20 @@ static char *stats_{self.name}_names[] = {{{names}}};
   if (genhash_lookup(*hash, real_packet, (void **) &old)) {{
     *real_packet = *old;
   }} else {{
-{key1}{fl}    memset(real_packet, 0, sizeof(*real_packet));{key2}
+{save_key}\
+{fl}\
+    memset(real_packet, 0, sizeof(*real_packet));
+{restore_key}\
   }}
 
-""".format(self = self, key1 = key1, key2 = key2, fl = fl)
+""".format(self = self, save_key = save_key, restore_key = restore_key, fl = fl)
         body += "".join(
             prefix("  ", field.get_get_wrapper(self, i, True))
             for i, field in enumerate(self.other_fields)
         )
 
-        extro="""
+        extro = """\
+
   if (NULL == old) {
     old = fc_malloc(sizeof(*old));
     *old = *real_packet;
@@ -1851,18 +1955,20 @@ static char *stats_{self.name}_names[] = {{{names}}};
 
         # Cancel some is-info packets.
         extro += "".join(
-            '''
+            """\
+
   hash = pc->phs.received + %s;
   if (NULL != *hash) {
     genhash_remove(*hash, real_packet);
   }
-''' % cancel_pack
+""" % cancel_pack
             for cancel_pack in self.cancel
         )
 
-        return body+extro+'''
+        return body + extro + """\
+
 #endif /* FREECIV_DELTA_PROTOCOL */
-'''
+"""
 
 # Class which represents a packet. A packet contains a list of fields.
 class Packet:
@@ -2051,15 +2157,21 @@ class Packet:
 
     # Returns a code fragment which contains the struct for this packet.
     def get_struct(self) -> str:
-        intro = "struct {self.name} {{\n".format(self = self)
-        extro="};\n\n"
+        intro = """\
+struct {self.name} {{
+""".format(self = self)
+        extro = """\
+};
+
+"""
 
         body = "".join(
-            "  %s;\n" % field.get_declar()
+            prefix("  ", field.get_declar())
             for field in chain(self.key_fields, self.other_fields)
-        ) or "  char __dummy;\t\t\t/* to avoid malloc(0); */\n"
+        ) or """\
+  char __dummy;\t\t\t/* to avoid malloc(0); */
+"""
         return intro+body+extro
-    # '''
 
     # Returns a code fragment which represents the prototypes of the
     # send and receive functions for the header file.
@@ -2096,7 +2208,8 @@ class Packet:
             func="packet"
             args=", packet"
 
-        return """{self.send_prototype}
+        return """\
+{self.send_prototype}
 {{
   if (!pc->used) {{
     log_error("WARNING: trying to send data to the closed connection %s",
@@ -2114,20 +2227,26 @@ class Packet:
         result=""
         for v in self.variants:
             if v.delta:
-                result=result+"#ifdef FREECIV_DELTA_PROTOCOL\n"
-                result=result+v.get_hash()
-                result=result+v.get_cmp()
-                result=result+v.get_bitvector()
-                result=result+"#endif /* FREECIV_DELTA_PROTOCOL */\n\n"
-            result=result+v.get_receive()
-            result=result+v.get_send()
+                result += """\
+#ifdef FREECIV_DELTA_PROTOCOL
+"""
+                result += v.get_hash()
+                result += v.get_cmp()
+                result += v.get_bitvector()
+                result += """\
+#endif /* FREECIV_DELTA_PROTOCOL */
+
+"""
+            result += v.get_receive()
+            result += v.get_send()
         return result
 
     # Returns a code fragment which is the implementation of the
     # lsend function.
     def get_lsend(self) -> str:
         if not self.want_lsend: return ""
-        return """{self.lsend_prototype}
+        return """\
+{self.lsend_prototype}
 {{
   conn_list_iterate(dest, pconn) {{
     send_{self.name}(pconn{self.extra_send_args2});
@@ -2140,12 +2259,16 @@ class Packet:
     # dsend function.
     def get_dsend(self) -> str:
         if not self.want_dsend: return ""
-        fill = "\n".join(field.get_fill() for field in self.fields)
-        return """{self.dsend_prototype}
+        fill = "".join(
+            prefix("  ", field.get_fill())
+            for field in self.fields
+        )
+        return """\
+{self.dsend_prototype}
 {{
   struct {self.name} packet, *real_packet = &packet;
 
-{fill}
+{fill}\
 
   return send_{self.name}(pc, real_packet);
 }}
@@ -2156,12 +2279,16 @@ class Packet:
     # dlsend function.
     def get_dlsend(self) -> str:
         if not (self.want_lsend and self.want_dsend): return ""
-        fill = "\n".join(field.get_fill() for field in self.fields)
-        return """{self.dlsend_prototype}
+        fill = "".join(
+            prefix("  ", field.get_fill())
+            for field in self.fields
+        )
+        return """\
+{self.dlsend_prototype}
 {{
   struct {self.name} packet, *real_packet = &packet;
 
-{fill}
+{fill}\
 
   lsend_{self.name}(dest, real_packet);
 }}
@@ -2177,23 +2304,31 @@ def all_caps_union(packets: typing.Iterable[Packet]) -> "set[str]":
 # packet_functional_capability string.
 def get_packet_functional_capability(packets: typing.Iterable[Packet]) -> str:
     all_caps = all_caps_union(packets)
-    return '''
+    return """\
+
 const char *const packet_functional_capability = "%s";
-'''%' '.join(sorted(all_caps))
+""" % " ".join(sorted(all_caps))
 
 # Returns a code fragment which is the implementation of the
 # delta_stats_report() function.
 def get_report(packets: typing.Iterable[Packet]) -> str:
-    if not generate_stats: return 'void delta_stats_report(void) {}\n\n'
+    if not generate_stats:
+        return """\
+void delta_stats_report(void) {}
 
-    intro='''
+"""
+
+    intro = """\
 void delta_stats_report(void) {
   int i;
 
-'''
-    extro='}\n\n'
+"""
+    extro = """\
+}
+
+"""
     body = "".join(
-        packet.get_report_part()
+        prefix("  ", packet.get_report_part())
         for packet in packets
     )
     return intro+body+extro
@@ -2201,13 +2336,21 @@ void delta_stats_report(void) {
 # Returns a code fragment which is the implementation of the
 # delta_stats_reset() function.
 def get_reset(packets: typing.Iterable[Packet]) -> str:
-    if not generate_stats: return 'void delta_stats_reset(void) {}\n\n'
-    intro='''
+    if not generate_stats:
+        return """\
+void delta_stats_reset(void) {}
+
+"""
+
+    intro = """\
 void delta_stats_reset(void) {
-'''
-    extro='}\n\n'
+"""
+    extro = """\
+}
+
+"""
     body = "".join(
-        packet.get_reset_part()
+        prefix("  ", packet.get_reset_part())
         for packet in packets
     )
     return intro+body+extro
@@ -2215,38 +2358,43 @@ void delta_stats_reset(void) {
 # Returns a code fragment which is the implementation of the
 # packet_name() function.
 def get_packet_name(packets: typing.Iterable[Packet]) -> str:
-    intro='''const char *packet_name(enum packet_type type)
+    intro = """\
+const char *packet_name(enum packet_type type)
 {
   static const char *const names[PACKET_LAST] = {
-'''
-
-    mapping = {
-        packet.type_number: packet
-        for packet in packets
-    }
+"""
 
     last=-1
     body=""
-    for n in sorted(mapping.keys()):
-        body += '    "unknown",\n' * (n - last - 1)
-        body=body+'    "%s",\n'%mapping[n].type
+    for n, packet_type in sorted(
+        (packet.type_number, packet.type)
+        for packet in packets
+    ):
+        body += """\
+    "unknown",
+""" * (n - last - 1)
+        body += """\
+    "%s",
+""" % packet_type
         last=n
 
-    extro='''  };
+    extro = """\
+  };
 
   return (type < PACKET_LAST ? names[type] : "unknown");
 }
 
-'''
+"""
     return intro+body+extro
 
 # Returns a code fragment which is the implementation of the
 # packet_has_game_info_flag() function.
 def get_packet_has_game_info_flag(packets: typing.Iterable[Packet]) -> str:
-    intro='''bool packet_has_game_info_flag(enum packet_type type)
+    intro = """\
+bool packet_has_game_info_flag(enum packet_type type)
 {
   static const bool flag[PACKET_LAST] = {
-'''
+"""
 
     mapping = {
         packet.type_number: packet
@@ -2255,185 +2403,212 @@ def get_packet_has_game_info_flag(packets: typing.Iterable[Packet]) -> str:
 
     last=-1
     body=""
-    for n in sorted(mapping.keys()):
-        body += '    FALSE,\n' * (n - last - 1)
-        if mapping[n].is_info!="game":
-            body=body+'    FALSE, /* %s */\n'%mapping[n].type
+    for n, packet in sorted(mapping.items()):
+        body += """\
+    FALSE,
+""" * (n - last - 1)
+        if packet.is_info != "game":
+            body += """\
+    FALSE, /* %s */
+""" % packet.type
         else:
-            body=body+'    TRUE, /* %s */\n'%mapping[n].type
+            body += """\
+    TRUE, /* %s */
+""" % packet.type
         last=n
 
-    extro='''  };
+    extro = """\
+  };
 
   return (type < PACKET_LAST ? flag[type] : FALSE);
 }
 
-'''
+"""
     return intro+body+extro
 
 # Returns a code fragment which is the implementation of the
 # packet_handlers_fill_initial() function.
 def get_packet_handlers_fill_initial(packets: typing.Sequence[Packet]) -> str:
-    intro='''void packet_handlers_fill_initial(struct packet_handlers *phandlers)
+    intro = """\
+void packet_handlers_fill_initial(struct packet_handlers *phandlers)
 {
-'''
-    all_caps = all_caps_union(packets)
-    for cap in sorted(all_caps):
-        intro=intro+'''  fc_assert_msg(has_capability("{0}", our_capability),
+"""
+    for cap in sorted(all_caps_union(packets)):
+        intro += """\
+  fc_assert_msg(has_capability("{0}", our_capability),
                 "Packets have support for unknown '{0}' capability!");
-'''.format(cap)
+""".format(cap)
 
-    sc_packets=[]
-    cs_packets=[]
-    unrestricted=[]
-    for p in packets:
-        if len(p.variants)==1:
-            # Packets with variants are correctly handled in
-            # packet_handlers_fill_capability(). They may remain without
-            # handler at connecting time, because it would be anyway wrong
-            # to use them before the network capability string would be
-            # known.
-            if len(p.dirs)==1 and p.dirs[0]=="sc":
-                sc_packets.append(p)
-            elif len(p.dirs)==1 and p.dirs[0]=="cs":
-                cs_packets.append(p)
-            else:
-                unrestricted.append(p)
+    # actually variants, not packets
+    sc_packets = [
+        p.variants[0]
+        for p in packets
+        if len(p.variants) == 1
+        and set(p.dirs) == {"sc"}
+    ]
+    cs_packets = [
+        p.variants[0]
+        for p in packets
+        if len(p.variants) == 1
+        and set(p.dirs) == {"cs"}
+    ]
+    unrestricted = [
+        p.variants[0]
+        for p in packets
+        if len(p.variants) == 1
+        and set(p.dirs) == {"sc", "cs"}
+    ]
 
-    body=""
-    for p in unrestricted:
-        body += """  {p.variants[0].send_handler}
-  {p.variants[0].receive_handler}
-""".format(p = p)
-    body=body+'''  if (is_server()) {
-'''
-    for p in sc_packets:
-        body += """    {p.variants[0].send_handler}
-""".format(p = p)
-    for p in cs_packets:
-        body += """    {p.variants[0].receive_handler}
-""".format(p = p)
-    body=body+'''  } else {
-'''
-    for p in cs_packets:
-        body += """    {p.variants[0].send_handler}
-""".format(p = p)
-    for p in sc_packets:
-        body += """    {p.variants[0].receive_handler}
-""".format(p = p)
+    body = "".join(
+        prefix("  ", p.send_handler) + prefix("  ", p.receive_handler)
+        for p in unrestricted
+    )
+    body += """\
+  if (is_server()) {
+"""
+    body += "".join(
+        prefix("    ", p.send_handler)
+        for p in sc_packets
+    )
+    body += "".join(
+        prefix("    ", p.receive_handler)
+        for p in cs_packets
+    )
+    body += """\
+  } else {
+"""
+    body += "".join(
+        prefix("    ", p.send_handler)
+        for p in cs_packets
+    )
+    body += "".join(
+        prefix("    ", p.receive_handler)
+        for p in sc_packets
+    )
 
-    extro='''  }
+    extro = """\
+  }
 }
 
-'''
+"""
     return intro+body+extro
 
 # Returns a code fragment which is the implementation of the
 # packet_handlers_fill_capability() function.
 def get_packet_handlers_fill_capability(packets: typing.Iterable[Packet]) -> str:
-    intro='''void packet_handlers_fill_capability(struct packet_handlers *phandlers,
+    intro = """\
+void packet_handlers_fill_capability(struct packet_handlers *phandlers,
                                      const char *capability)
 {
-'''
+"""
 
-    sc_packets=[]
-    cs_packets=[]
-    unrestricted=[]
-    for p in packets:
-        if len(p.variants)>1:
-            if len(p.dirs)==1 and p.dirs[0]=="sc":
-                sc_packets.append(p)
-            elif len(p.dirs)==1 and p.dirs[0]=="cs":
-                cs_packets.append(p)
-            else:
-                unrestricted.append(p)
+    sc_packets = [
+        p
+        for p in packets
+        if len(p.variants) > 1
+        and set(p.dirs) == {"sc"}
+    ]
+    cs_packets = [
+        p
+        for p in packets
+        if len(p.variants) > 1
+        and set(p.dirs) == {"cs"}
+    ]
+    unrestricted = [
+        p
+        for p in packets
+        if len(p.variants) > 1
+        and set(p.dirs) == {"sc", "cs"}
+    ]
 
     body=""
     for p in unrestricted:
-        body=body+"  "
+        body += "  "
         for v in p.variants:
             body += """if ({v.condition}) {{
     {v.log_macro}("{v.type}: using variant={v.no} cap=%s", capability);
-    {v.send_handler}
-    {v.receive_handler}
+    {v.send_handler}\
+    {v.receive_handler}\
   }} else """.format(v = v)
         body += """{{
     log_error("Unknown {p.type} variant for cap %s", capability);
   }}
 """.format(p = p)
-    if len(cs_packets)>0 or len(sc_packets)>0:
-        body=body+'''  if (is_server()) {
-'''
+    if cs_packets or sc_packets:
+        body += """\
+  if (is_server()) {
+"""
         for p in sc_packets:
-            body=body+"    "
+            body += "    "
             for v in p.variants:
                 body += """if ({v.condition}) {{
       {v.log_macro}("{v.type}: using variant={v.no} cap=%s", capability);
-      {v.send_handler}
+      {v.send_handler}\
     }} else """.format(v = v)
             body += """{{
       log_error("Unknown {p.type} variant for cap %s", capability);
     }}
 """.format(p = p)
         for p in cs_packets:
-            body=body+"    "
+            body += "    "
             for v in p.variants:
                 body += """if ({v.condition}) {{
       {v.log_macro}("{v.type}: using variant={v.no} cap=%s", capability);
-      {v.receive_handler}
+      {v.receive_handler}\
     }} else """.format(v = v)
             body += """{{
       log_error("Unknown {p.type} variant for cap %s", capability);
     }}
 """.format(p = p)
-        body=body+'''  } else {
-'''
+        body += """\
+  } else {
+"""
         for p in cs_packets:
-            body=body+"    "
+            body += "    "
             for v in p.variants:
                 body += """if ({v.condition}) {{
       {v.log_macro}("{v.type}: using variant={v.no} cap=%s", capability);
-      {v.send_handler}
+      {v.send_handler}\
     }} else """.format(v = v)
             body += """{{
       log_error("Unknown {p.type} variant for cap %s", capability);
     }}
 """.format(p = p)
         for p in sc_packets:
-            body=body+"    "
+            body += "    "
             for v in p.variants:
                 body += """if ({v.condition}) {{
       {v.log_macro}("{v.type}: using variant={v.no} cap=%s", capability);
-      {v.receive_handler}
+      {v.receive_handler}\
     }} else """.format(v = v)
             body += """{{
       log_error("Unknown {p.type} variant for cap %s", capability);
     }}
 """.format(p = p)
-        body=body+'''  }
-'''
+        body += """\
+  }
+"""
 
-    extro='''}
-'''
+    extro = """\
+}
+"""
     return intro+body+extro
 
 # Returns a code fragment which is the declartion of
 # "enum packet_type".
 def get_enum_packet(packets: typing.Iterable[Packet]) -> str:
-    intro="enum packet_type {\n"
+    intro = """\
+enum packet_type {
+"""
 
-    mapping={}
-    for p in packets:
-        if p.type_number in mapping:
-            num = p.type_number
-            other = mapping[num]
-            raise ValueError("Duplicate packet ID %d: %s and %s" % (num, other.name, p.name))
-        mapping[p.type_number]=p
+    mapping = {
+        p.type_number: p
+        for p in packets
+    }
 
     last=-1
     body=""
-    for i in sorted(mapping.keys()):
-        p=mapping[i]
+    for i, p in sorted(mapping.items()):
         if i!=last+1:
             line="  %s = %d,"%(p.type,i)
         else:
@@ -2444,11 +2619,12 @@ def get_enum_packet(packets: typing.Iterable[Packet]) -> str:
         body=body+line+"\n"
 
         last=i
-    extro='''
+    extro = """\
+
   PACKET_LAST  /* leave this last */
 };
 
-'''
+"""
     return intro+body+extro
 
 
@@ -2510,7 +2686,8 @@ def write_common_header(path: "str | Path | None", packets: typing.Sequence[Pack
     if path is None:
         return
     with fc_open(path) as output_h, wrap_header(output_h, "packets_gen"):
-        output_h.write('''
+        output_h.write("""\
+
 /* common */
 #include "actions.h"
 #include "city.h"
@@ -2520,7 +2697,7 @@ def write_common_header(path: "str | Path | None", packets: typing.Sequence[Pack
 /* common/aicore */
 #include "cm.h"
 
-''')
+""")
 
         # write structs
         for p in packets:
@@ -2531,17 +2708,19 @@ def write_common_header(path: "str | Path | None", packets: typing.Sequence[Pack
         # write function prototypes
         for p in packets:
             output_h.write(p.get_prototypes())
-        output_h.write('''
+        output_h.write("""\
+
 void delta_stats_report(void);
 void delta_stats_reset(void);
-''')
+""")
 
 def write_common_impl(path: "str | Path | None", packets: typing.Sequence[Packet]):
     """Write contents for common/packets_gen.c to the given path"""
     if path is None:
         return
     with fc_open(path) as output_c:
-        output_c.write('''
+        output_c.write("""\
+
 #ifdef HAVE_CONFIG_H
 #include <fc_config.h>
 #endif
@@ -2563,9 +2742,10 @@ def write_common_impl(path: "str | Path | None", packets: typing.Sequence[Packet
 #include "game.h"
 
 #include "packets.h"
-''')
+""")
         output_c.write(get_packet_functional_capability(packets))
-        output_c.write('''
+        output_c.write("""\
+
 #ifdef FREECIV_DELTA_PROTOCOL
 static genhash_val_t hash_const(const void *vkey)
 {
@@ -2577,19 +2757,17 @@ static bool cmp_const(const void *vkey1, const void *vkey2)
   return TRUE;
 }
 #endif /* FREECIV_DELTA_PROTOCOL */
-''')
+""")
 
         if generate_stats:
-            output_c.write('''
+            output_c.write("""\
+
 static int stats_total_sent;
 
-''')
-
-        if generate_stats:
-            # write stats
+""")
             for p in packets:
                 output_c.write(p.get_stats())
-            # write report()
+
         output_c.write(get_report(packets))
         output_c.write(get_reset(packets))
 
@@ -2612,7 +2790,8 @@ def write_server_header(path: "str | Path | None", packets: typing.Iterable[Pack
     if path is None:
         return
     with fc_open(path) as f, wrap_header(f, "hand_gen", cplusplus = False):
-        f.write('''
+        f.write("""\
+
 /* utility */
 #include "shared.h"
 
@@ -2625,33 +2804,44 @@ struct connection;
 bool server_handle_packet(enum packet_type type, const void *packet,
                           struct player *pplayer, struct connection *pconn);
 
-''')
+""")
 
         for p in packets:
             if "cs" in p.dirs and not p.no_handle:
                 a=p.name[len("packet_"):]
-                b = "".join(
-                    ", %s%s" % (field.get_handle_type(), field.name)
-                    for field in p.fields
-                )
                 if p.handle_via_packet:
-                    f.write('struct %s;\n'%p.name)
+                    f.write("""\
+struct %s;
+""" % p.name)
                     if p.handle_per_conn:
-                        f.write('void handle_%s(struct connection *pc, const struct %s *packet);\n'%(a,p.name))
+                        f.write("""\
+void handle_%s(struct connection *pc, const struct %s *packet);
+""" % (a, p.name))
                     else:
-                        f.write('void handle_%s(struct player *pplayer, const struct %s *packet);\n'%(a,p.name))
+                        f.write("""\
+void handle_%s(struct player *pplayer, const struct %s *packet);
+""" % (a, p.name))
                 else:
+                    b = "".join(
+                        ", %s%s" % (field.get_handle_type(), field.name)
+                        for field in p.fields
+                    )
                     if p.handle_per_conn:
-                        f.write('void handle_%s(struct connection *pc%s);\n'%(a,b))
+                        f.write("""\
+void handle_%s(struct connection *pc%s);
+""" % (a, b))
                     else:
-                        f.write('void handle_%s(struct player *pplayer%s);\n'%(a,b))
+                        f.write("""\
+void handle_%s(struct player *pplayer%s);
+""" % (a, b))
 
 def write_client_header(path: "str | Path | None", packets: typing.Iterable[Packet]):
     """Write contents for client/packhand_gen.h to the given path"""
     if path is None:
         return
     with fc_open(path) as f, wrap_header(f, "packhand_gen"):
-        f.write('''
+        f.write("""\
+
 /* utility */
 #include "shared.h"
 
@@ -2660,27 +2850,34 @@ def write_client_header(path: "str | Path | None", packets: typing.Iterable[Pack
 
 bool client_handle_packet(enum packet_type type, const void *packet);
 
-''')
+""")
         for p in packets:
             if "sc" not in p.dirs: continue
 
             a=p.name[len("packet_"):]
-            b = ", ".join(
-                "%s%s" % (field.get_handle_type(), field.name)
-                for field in p.fields
-            ) or "void"
             if p.handle_via_packet:
-                f.write('struct %s;\n'%p.name)
-                f.write('void handle_%s(const struct %s *packet);\n'%(a,p.name))
+                f.write("""\
+struct %s;
+""" % p.name)
+                f.write("""\
+void handle_%s(const struct %s *packet);
+""" % (a, p.name))
             else:
-                f.write('void handle_%s(%s);\n'%(a,b))
+                b = ", ".join(
+                    "%s%s" % (field.get_handle_type(), field.name)
+                    for field in p.fields
+                ) or "void"
+                f.write("""\
+void handle_%s(%s);
+""" % (a, b))
 
 def write_server_impl(path: "str | Path | None", packets: typing.Iterable[Packet]):
     """Write contents for server/hand_gen.c to the given path"""
     if path is None:
         return
     with fc_open(path) as f:
-        f.write('''
+        f.write("""\
+
 
 #ifdef HAVE_CONFIG_H
 #include <fc_config.h>
@@ -2695,21 +2892,12 @@ bool server_handle_packet(enum packet_type type, const void *packet,
                           struct player *pplayer, struct connection *pconn)
 {
   switch (type) {
-''')
+""")
         for p in packets:
             if "cs" not in p.dirs: continue
             if p.no_handle: continue
             a=p.name[len("packet_"):]
             c='((const struct %s *)packet)->'%p.name
-            b=[]
-            for x in p.fields:
-                y="%s%s"%(c,x.name)
-                if x.dataio_type=="worklist":
-                    y="&"+y
-                b.append(y)
-            b=",\n      ".join(b)
-            if b:
-                b=",\n      "+b
 
             if p.handle_via_packet:
                 if p.handle_per_conn:
@@ -2718,28 +2906,40 @@ bool server_handle_packet(enum packet_type type, const void *packet,
                     args="pplayer, packet"
 
             else:
+                b=[]
+                for x in p.fields:
+                    y="%s%s"%(c,x.name)
+                    if x.dataio_type=="worklist":
+                        y="&"+y
+                    b.append(y)
+                b=",\n      ".join(b)
+                if b:
+                    b=",\n      "+b
                 if p.handle_per_conn:
                     args="pconn"+b
                 else:
                     args="pplayer"+b
 
-            f.write('''  case %s:
+            f.write("""\
+  case %s:
     handle_%s(%s);
     return TRUE;
 
-'''%(p.type,a,args))
-        f.write('''  default:
+""" % (p.type, a, args))
+        f.write("""\
+  default:
     return FALSE;
   }
 }
-''')
+""")
 
 def write_client_impl(path: "str | Path | None", packets: typing.Iterable[Packet]):
     """Write contents for client/packhand_gen.c to the given path"""
     if path is None:
         return
     with fc_open(path) as f:
-        f.write('''
+        f.write("""\
+
 
 #ifdef HAVE_CONFIG_H
 #include <fc_config.h>
@@ -2753,37 +2953,39 @@ def write_client_impl(path: "str | Path | None", packets: typing.Iterable[Packet
 bool client_handle_packet(enum packet_type type, const void *packet)
 {
   switch (type) {
-''')
+""")
         for p in packets:
             if "sc" not in p.dirs: continue
             if p.no_handle: continue
             a=p.name[len("packet_"):]
             c='((const struct %s *)packet)->'%p.name
-            b=[]
-            for x in p.fields:
-                y="%s%s"%(c,x.name)
-                if x.dataio_type=="worklist":
-                    y="&"+y
-                b.append(y)
-            b=",\n      ".join(b)
-            if b:
-                b="\n      "+b
 
             if p.handle_via_packet:
                 args="packet"
             else:
+                b=[]
+                for x in p.fields:
+                    y="%s%s"%(c,x.name)
+                    if x.dataio_type=="worklist":
+                        y="&"+y
+                    b.append(y)
+                b=",\n      ".join(b)
+                if b:
+                    b="\n      "+b
                 args=b
 
-            f.write('''  case %s:
+            f.write("""\
+  case %s:
     handle_%s(%s);
     return TRUE;
 
-'''%(p.type,a,args))
-        f.write('''  default:
+""" % (p.type, a, args))
+        f.write("""\
+  default:
     return FALSE;
   }
 }
-''')
+""")
 
 
 # Main function. It reads and parses the input and generates the
