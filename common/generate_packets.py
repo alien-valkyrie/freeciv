@@ -21,7 +21,7 @@ import argparse
 from pathlib import Path
 from contextlib import contextmanager
 from functools import partial
-from itertools import chain, combinations
+from itertools import chain, combinations, takewhile
 from collections import deque
 
 try:
@@ -1891,26 +1891,8 @@ if (NULL != *hash) {
 
 # Class which represents a packet. A packet contains a list of fields.
 class Packet:
-    # matches a packet's header line (packet type, number, flags)
-    HEADER_PATTERN = re.compile(r"^\s*(\S+)\s*=\s*(\d+)\s*;\s*(.*?)\s*$")
     # matches a packet cancel flag (cancelled packet type)
     CANCEL_PATTERN = re.compile(r"^cancel\((.*)\)$")
-
-    @classmethod
-    def parse(cls, text: str, types: typing.Mapping[str, str]) -> "Packet":
-        text = text.strip()
-        header, *lines = text.split("\n")
-
-        mo = __class__.HEADER_PATTERN.fullmatch(header)
-        if mo is None:
-            raise ValueError("not a valid packet header line: %r" % header)
-
-        packet_type, packet_number, flags_text = mo.groups("")
-        packet_number = int(packet_number)
-        if packet_number not in range(65536):
-            raise ValueError("packet number %d for %s outside legal range [0,65536)" % (packet_number, packet_type))
-
-        return cls(packet_type, packet_number, flags_text, lines, types)
 
     def __init__(self, packet_type: str, packet_number: int, flags_text: str,
                        lines: typing.Iterable[str], types: typing.Mapping[str, str]):
@@ -2554,7 +2536,6 @@ enum packet_type {
 
 ####################### Parsing packets.def contents #######################
 
-# matches /* ... */ block comments as well as # ... and // ... EOL comments
 COMMENT_PATTERN = re.compile(r"""
     (?:         # block comment
         /\*         # initial /*
@@ -2566,49 +2547,71 @@ COMMENT_PATTERN = re.compile(r"""
         $           # matches line end in MULTILINE mode
     )
 """, re.VERBOSE | re.MULTILINE)
-# matches "type alias = dest" lines
-TYPE_PATTERN = re.compile(r"^type\s+(?P<alias>\S+)\s*=\s*(?P<dest>.+)\s*$")
-# matches the "end" line separating packet definitions
-PACKET_SEP_PATTERN = re.compile(r"^end$", re.MULTILINE)
+"""Matches /* ... */ block comments and # ... and // ... EOL comments"""
 
 def packets_def_lines(def_text: str) -> typing.Iterator[str]:
     """Yield only actual content lines without comments and whitespace"""
     text = COMMENT_PATTERN.sub("", def_text)
     return filter(None, map(str.strip, text.split("\n")))
 
-def parse_packets_def(def_text: str) -> "list[Packet]":
+TYPE_PATTERN = re.compile(r"^\s*type\s+(\w+)\s*=\s*(.+?)\s*$")
+"""Matches type alias definition lines
+
+Groups:
+- the alias to define
+- the meaning for the alias"""
+
+PACKET_HEADER_PATTERN = re.compile(r"^\s*(PACKET_\w+)\s*=\s*(\d+)\s*;\s*(.*?)\s*$")
+"""Matches the header line of a packet definition
+
+Groups:
+- packet type name
+- packet number
+- packet flags text"""
+
+PACKET_END_PATTERN = re.compile(r"^\s*end\s*$")
+"""Matches the end line terminating a packet definition"""
+
+def parse_packets_def(def_text: str) -> typing.Iterable[Packet]:
     """Parse the given string as contents of packets.def"""
 
-    # parse type alias definitions
-    packets_lines = []
     types = {}
-    for line in packets_def_lines(def_text):
+    # hold on to the iterator itself
+    lines_iter = iter(packets_def_lines(def_text))
+    for line in lines_iter:
         mo = TYPE_PATTERN.fullmatch(line)
-        if mo is None:
-            packets_lines.append(line)
+        if mo is not None:
+            # type definition line
+            alias, dest = mo.groups("")
+            if alias in types:
+                if dest == types[alias]:
+                    verbose("duplicate typedef: %r = %r" % (alias, dest))
+                    continue
+                else:
+                    raise ValueError("duplicate type alias %r: %r and %r"
+                                        % (alias, types[alias], dest))
+            types[alias] = dest
             continue
 
-        alias = mo.group("alias")
-        dest = mo.group("dest")
-        if alias in types:
-            if dest == types[alias]:
-                verbose("duplicate typedef: %r = %r" % (alias, dest))
-                continue
-            else:
-                raise ValueError("duplicate type alias %r: %r and %r"
-                                    % (alias, types[alias], dest))
-        types[alias] = dest
+        mo = PACKET_HEADER_PATTERN.fullmatch(line)
+        if mo is not None:
+            # packet header line
+            packet_type, packet_number, flags_text = mo.groups("")
+            packet_number = int(packet_number)
+            if packet_number not in range(65536):
+                raise ValueError("packet number %d for %s outside legal range [0,65536)" % (packet_number, packet_type))
 
-    # parse packet definitions
-    packets=[]
-    for packet_text in PACKET_SEP_PATTERN.split("\n".join(packets_lines)):
-        packet_text = packet_text.strip()
-        if packet_text:
-            packets.append(Packet.parse(packet_text, types))
+            yield Packet(
+                packet_type, packet_number, flags_text,
+                takewhile(
+                    lambda line: PACKET_END_PATTERN.fullmatch(line) is None,
+                    lines_iter, # advance the iterator used by this for-loop
+                ),
+                types,
+            )
+            continue
 
-    # Note: only the packets are returned, as the type aliases
-    # are not needed any further
-    return packets
+        raise ValueError("Unexpected line: " + line)
 
 
 ########################### Writing output files ###########################
@@ -2915,7 +2918,7 @@ def main(raw_args: "typing.Sequence[str] | None" = None):
     input_path = src_dir / "networking" / "packets.def"
 
     def_text = read_text(input_path, allow_missing = False)
-    packets = parse_packets_def(def_text)
+    packets = list(parse_packets_def(def_text))
     ### parsing finished
 
     write_common_header(script_args.common_header_path, packets)
