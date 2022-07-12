@@ -1896,23 +1896,28 @@ class Packet:
     # matches a packet cancel flag (cancelled packet type)
     CANCEL_PATTERN = re.compile(r"^cancel\((.*)\)$")
 
-    def __init__(self, text: str, types: typing.Mapping[str, str]):
+    @classmethod
+    def parse(cls, text: str, types: typing.Mapping[str, str]) -> "Packet":
         text = text.strip()
-        lines = text.split("\n")
+        header, *lines = text.split("\n")
 
-        mo = __class__.HEADER_PATTERN.fullmatch(lines[0])
+        mo = __class__.HEADER_PATTERN.fullmatch(header)
         if mo is None:
-            raise ValueError("not a valid packet header line: %r" % lines[0])
+            raise ValueError("not a valid packet header line: %r" % header)
 
-        self.type=mo.group(1)
-        self.type_number=int(mo.group(2))
-        if self.type_number not in range(65536):
-            raise ValueError("packet number %d for %s outside legal range [0,65536)" % (self.type_number, self.name))
-        dummy=mo.group(3)
+        packet_type, packet_number, flags_text = mo.groups("")
+        packet_number = int(packet_number)
+        if packet_number not in range(65536):
+            raise ValueError("packet number %d for %s outside legal range [0,65536)" % (packet_number, packet_type))
 
-        del lines[0]
+        return cls(packet_type, packet_number, flags_text, lines, types)
 
-        arr=list(item.strip() for item in dummy.split(",") if item)
+    def __init__(self, packet_type: str, packet_number: int, flags_text: str,
+                       lines: typing.Iterable[str], types: typing.Mapping[str, str]):
+        self.type = packet_type
+        self.type_number = packet_number
+
+        arr = [item.strip() for item in flags_text.split(",") if item]
 
         self.dirs=[]
 
@@ -2599,7 +2604,7 @@ def parse_packets_def(def_text: str) -> "list[Packet]":
     for packet_text in PACKET_SEP_PATTERN.split("\n".join(packets_lines)):
         packet_text = packet_text.strip()
         if packet_text:
-            packets.append(Packet(packet_text, types))
+            packets.append(Packet.parse(packet_text, types))
 
     # Note: only the packets are returned, as the type aliases
     # are not needed any further
