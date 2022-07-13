@@ -1284,8 +1284,8 @@ class Variant:
         return self.packet.is_info
 
     @property
-    def cancel(self) -> "list[str]":
-        """List of packets to cancel when sending or receiving this packet
+    def cancel(self) -> typing.AbstractSet[str]:
+        """Packets to cancel when sending or receiving this packet
 
         See Packet.cancel"""
         return self.packet.cancel
@@ -1706,7 +1706,7 @@ if (e) {
 """
 
         # Cancel some is-info packets.
-        for i in self.cancel:
+        for i in sorted(self.cancel):
             body += """\
 
 hash = pc->phs.sent + %s;
@@ -1881,7 +1881,7 @@ if (NULL != *hash) {
   genhash_remove(*hash, real_packet);
 }
 """ % cancel_pack
-            for cancel_pack in self.cancel
+            for cancel_pack in sorted(self.cancel)
         )
 
         return body + extro + """\
@@ -1894,78 +1894,90 @@ class Packet:
     # matches a packet cancel flag (cancelled packet type)
     CANCEL_PATTERN = re.compile(r"^cancel\((.*)\)$")
 
+    is_info = "no"
+    """Whether this is an info or game-info packet.
+
+    "no" (default) means normal packet
+    "yes" means is-info packet
+    "game" means is-game-info packet"""
+
+    want_pre_send = False
+    want_post_send = False
+    want_post_recv = False
+    delta = True
+    handle_via_packet = False
+    handle_per_conn = False
+    no_handle = False
+    want_dsend = False
+    want_lsend = False
+    want_force = False
+
     def __init__(self, packet_type: str, packet_number: int, flags_text: str,
                        lines: typing.Iterable[str], types: typing.Mapping[str, str]):
         self.type = packet_type
         self.type_number = packet_number
 
-        arr = [item.strip() for item in flags_text.split(",") if item]
+        flag_texts = {
+            stripped
+            for item in flags_text.split(",")
+            for stripped in (item.strip(),)
+            if stripped
+        }
 
-        self.dirs=[]
+        self.dirs = set()
+        self.cancel = set()
 
-        if "sc" in arr:
-            self.dirs.append("sc")
-            arr.remove("sc")
-        if "cs" in arr:
-            self.dirs.append("cs")
-            arr.remove("cs")
+        for flag in flag_texts:
+            if flag in ("sc", "cs"):
+                self.dirs.add(flag)
+                continue
+            if flag == "is-info":
+                self.is_info = "yes"
+                continue
+            if flag == "is-game-info":
+                self.is_info = "game"
+                continue
+            if flag == "pre-send":
+                self.want_pre_send = True
+                continue
+            if flag == "post-send":
+                self.want_post_send = True
+                continue
+            if flag == "post-recv":
+                self.want_post_recv = True
+                continue
+            if flag == "no-delta":
+                self.delta = False
+                continue
+            if flag == "handle-via-packet":
+                self.handle_via_packet = True
+                continue
+            if flag == "handle-per-conn":
+                self.handle_per_conn = True
+                continue
+            if flag == "no-handle":
+                self.no_handle = True
+                continue
+            if flag == "dsend":
+                self.want_dsend = True
+                continue
+            if flag == "lsend":
+                self.want_lsend = True
+                continue
+            if flag == "force":
+                self.want_force = True
+                continue
+
+            ## if (mo := self.CANCEL_PATTERN.fullmatch(flag)) is not None:
+            mo = self.CANCEL_PATTERN.fullmatch(flag)
+            if mo is not None:
+                self.cancel.add(mo.group(1))
+                continue
+
+            raise ValueError("Unrecognized flag: " + flag)
 
         if not self.dirs:
             raise ValueError("no directions defined for %s" % self.name)
-
-        # "no" means normal packet
-        # "yes" means is-info packet
-        # "game" means is-game-info packet
-        self.is_info="no"
-        if "is-info" in arr:
-            self.is_info="yes"
-            arr.remove("is-info")
-        if "is-game-info" in arr:
-            self.is_info="game"
-            arr.remove("is-game-info")
-
-        self.want_pre_send="pre-send" in arr
-        if self.want_pre_send: arr.remove("pre-send")
-
-        self.want_post_recv="post-recv" in arr
-        if self.want_post_recv: arr.remove("post-recv")
-
-        self.want_post_send="post-send" in arr
-        if self.want_post_send: arr.remove("post-send")
-
-        self.delta="no-delta" not in arr
-        if not self.delta: arr.remove("no-delta")
-
-        self.handle_via_packet="handle-via-packet" in arr
-        if self.handle_via_packet: arr.remove("handle-via-packet")
-
-        self.handle_per_conn="handle-per-conn" in arr
-        if self.handle_per_conn: arr.remove("handle-per-conn")
-
-        self.no_handle="no-handle" in arr
-        if self.no_handle: arr.remove("no-handle")
-
-        self.want_dsend = "dsend" in arr
-        if self.want_dsend: arr.remove("dsend")
-
-        self.want_lsend="lsend" in arr
-        if self.want_lsend: arr.remove("lsend")
-
-        self.want_force="force" in arr
-        if self.want_force: arr.remove("force")
-
-        self.cancel=[]
-        removes=[]
-        remaining=[]
-        for i in arr:
-            mo = __class__.CANCEL_PATTERN.fullmatch(i)
-            if mo:
-                self.cancel.append(mo.group(1))
-                continue
-            remaining.append(i)
-
-        if remaining:
-            raise ValueError("unrecognized flags for %s: %r" % (self.name, remaining))
 
         self.fields = [
             field
@@ -2365,9 +2377,9 @@ void packet_handlers_fill_initial(struct packet_handlers *phandlers)
             # handler at connecting time, because it would be anyway wrong
             # to use them before the network capability string would be
             # known.
-            if len(p.dirs)==1 and p.dirs[0]=="sc":
+            if p.dirs == {"sc"}:
                 sc_packets.append(p)
-            elif len(p.dirs)==1 and p.dirs[0]=="cs":
+            elif p.dirs == {"cs"}:
                 cs_packets.append(p)
             else:
                 unrestricted.append(p)
@@ -2412,9 +2424,9 @@ void packet_handlers_fill_capability(struct packet_handlers *phandlers,
     unrestricted=[]
     for p in packets:
         if len(p.variants)>1:
-            if len(p.dirs)==1 and p.dirs[0]=="sc":
+            if p.dirs == {"sc"}:
                 sc_packets.append(p)
-            elif len(p.dirs)==1 and p.dirs[0]=="cs":
+            elif p.dirs == {"cs"}:
                 cs_packets.append(p)
             else:
                 unrestricted.append(p)
