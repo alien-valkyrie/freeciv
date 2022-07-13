@@ -2224,6 +2224,113 @@ struct {self.name} {{
 """.format(self = self, fill = fill)
 
 
+class PacketsDefinition(typing.Iterable[Packet]):
+    """Represents an entire packets definition file"""
+
+    COMMENT_PATTERN = re.compile(r"""
+        (?:         # block comment
+            /\*         # initial /*
+            (?:.|\s)*?  # note the reluctant quantifier
+            \*/         # terminating */
+        ) | (?:     # EOL comment
+            (?:\#|//)   # initial # or //
+            .*          # does *not* match newline without DOTALL
+            $           # matches line end in MULTILINE mode
+        )
+    """, re.VERBOSE | re.MULTILINE)
+    """Matches /* ... */ block comments and # ... and // ... EOL comments"""
+
+    TYPE_PATTERN = re.compile(r"^\s*type\s+(\w+)\s*=\s*(.+?)\s*$")
+    """Matches type alias definition lines
+
+    Groups:
+    - the alias to define
+    - the meaning for the alias"""
+
+    PACKET_HEADER_PATTERN = re.compile(r"^\s*(PACKET_\w+)\s*=\s*(\d+)\s*;\s*(.*?)\s*$")
+    """Matches the header line of a packet definition
+
+    Groups:
+    - packet type name
+    - packet number
+    - packet flags text"""
+
+    PACKET_END_PATTERN = re.compile(r"^\s*end\s*$")
+    """Matches the end line terminating a packet definition"""
+
+    @classmethod
+    def packets_def_lines(cls, def_text: str) -> typing.Iterator[str]:
+        """Yield only actual content lines without comments and whitespace"""
+        text = cls.COMMENT_PATTERN.sub("", def_text)
+        return filter(None, map(str.strip, text.split("\n")))
+
+    def __init__(self):
+        self.types = {}
+        self.packets = []
+        self.packets_by_number = {}
+        self.packets_by_type = {}
+
+    def parse_text(self, def_text: str):
+        """Parse the given text as contents of a packets.def file"""
+        self.parse_lines(self.packets_def_lines(def_text))
+
+    def parse_lines(self, lines: typing.Iterable[str]):
+        """Parse the given lines as type and packet definitions"""
+
+        lines_iter = iter(lines)
+        for line in lines_iter:
+            mo = self.TYPE_PATTERN.fullmatch(line)
+            if mo is not None:
+                # type definition line
+                alias, dest = mo.groups("")
+                if alias in self.types:
+                    if dest == self.types[alias]:
+                        verbose("duplicate typedef: %r = %r" % (alias, dest))
+                        continue
+                    else:
+                        raise ValueError("duplicate type alias %r: %r and %r"
+                                            % (alias, self.types[alias], dest))
+                self.types[alias] = dest
+                continue
+
+            mo = self.PACKET_HEADER_PATTERN.fullmatch(line)
+            if mo is not None:
+                # packet header line
+                packet_type, packet_number, flags_text = mo.groups("")
+                packet_type = packet_type.upper()
+                packet_number = int(packet_number)
+
+                if packet_type in self.packets_by_type:
+                    raise ValueError("Duplicate packet type: " + packet_type)
+
+                if packet_number not in range(65536):
+                    raise ValueError("packet number %d for %s outside legal range [0,65536)" % (packet_number, packet_type))
+                if packet_number in self.packets_by_number:
+                    raise ValueError("Duplicate packet number: %d (%s and %s)" % (
+                        packet_number,
+                        self.packets_by_number[packet_number].type,
+                        packet_type,
+                    ))
+
+                packet = Packet(
+                    packet_type, packet_number, flags_text,
+                    takewhile(
+                        lambda line: self.PACKET_END_PATTERN.fullmatch(line) is None,
+                        lines_iter, # advance the iterator used by this for-loop
+                    ),
+                    self.types,
+                )
+                self.packets.append(packet)
+                self.packets_by_number[packet_number] = packet
+                self.packets_by_type[packet_type] = packet
+                continue
+
+            raise ValueError("Unexpected line: " + line)
+
+    def __iter__(self) -> typing.Iterator[Packet]:
+        return iter(self.packets)
+
+
 def all_caps_union(packets: typing.Iterable[Packet]) -> "set[str]":
     """Return a set of all capabilities affecting the given packets"""
     return set().union(*(p.all_caps for p in packets))
@@ -2355,7 +2462,7 @@ bool packet_has_game_info_flag(enum packet_type type)
 
 # Returns a code fragment which is the implementation of the
 # packet_handlers_fill_initial() function.
-def get_packet_handlers_fill_initial(packets: typing.Sequence[Packet]) -> str:
+def get_packet_handlers_fill_initial(packets: typing.Iterable[Packet]) -> str:
     intro = """\
 void packet_handlers_fill_initial(struct packet_handlers *phandlers)
 {
@@ -2546,89 +2653,9 @@ enum packet_type {
     return intro+body+extro
 
 
-####################### Parsing packets.def contents #######################
-
-COMMENT_PATTERN = re.compile(r"""
-    (?:         # block comment
-        /\*         # initial /*
-        (?:.|\s)*?  # note the reluctant quantifier
-        \*/         # terminating */
-    ) | (?:     # EOL comment
-        (?:\#|//)   # initial # or //
-        .*          # does *not* match newline without DOTALL
-        $           # matches line end in MULTILINE mode
-    )
-""", re.VERBOSE | re.MULTILINE)
-"""Matches /* ... */ block comments and # ... and // ... EOL comments"""
-
-def packets_def_lines(def_text: str) -> typing.Iterator[str]:
-    """Yield only actual content lines without comments and whitespace"""
-    text = COMMENT_PATTERN.sub("", def_text)
-    return filter(None, map(str.strip, text.split("\n")))
-
-TYPE_PATTERN = re.compile(r"^\s*type\s+(\w+)\s*=\s*(.+?)\s*$")
-"""Matches type alias definition lines
-
-Groups:
-- the alias to define
-- the meaning for the alias"""
-
-PACKET_HEADER_PATTERN = re.compile(r"^\s*(PACKET_\w+)\s*=\s*(\d+)\s*;\s*(.*?)\s*$")
-"""Matches the header line of a packet definition
-
-Groups:
-- packet type name
-- packet number
-- packet flags text"""
-
-PACKET_END_PATTERN = re.compile(r"^\s*end\s*$")
-"""Matches the end line terminating a packet definition"""
-
-def parse_packets_def(def_text: str) -> typing.Iterable[Packet]:
-    """Parse the given string as contents of packets.def"""
-
-    types = {}
-    # hold on to the iterator itself
-    lines_iter = iter(packets_def_lines(def_text))
-    for line in lines_iter:
-        mo = TYPE_PATTERN.fullmatch(line)
-        if mo is not None:
-            # type definition line
-            alias, dest = mo.groups("")
-            if alias in types:
-                if dest == types[alias]:
-                    verbose("duplicate typedef: %r = %r" % (alias, dest))
-                    continue
-                else:
-                    raise ValueError("duplicate type alias %r: %r and %r"
-                                        % (alias, types[alias], dest))
-            types[alias] = dest
-            continue
-
-        mo = PACKET_HEADER_PATTERN.fullmatch(line)
-        if mo is not None:
-            # packet header line
-            packet_type, packet_number, flags_text = mo.groups("")
-            packet_number = int(packet_number)
-            if packet_number not in range(65536):
-                raise ValueError("packet number %d for %s outside legal range [0,65536)" % (packet_number, packet_type))
-
-            yield Packet(
-                packet_type, packet_number, flags_text,
-                takewhile(
-                    lambda line: PACKET_END_PATTERN.fullmatch(line) is None,
-                    lines_iter, # advance the iterator used by this for-loop
-                ),
-                types,
-            )
-            continue
-
-        raise ValueError("Unexpected line: " + line)
-
-
 ########################### Writing output files ###########################
 
-def write_common_header(path: "str | Path | None", packets: typing.Sequence[Packet]):
+def write_common_header(path: "str | Path | None", packets: typing.Iterable[Packet]):
     """Write contents for common/packets_gen.h to the given path"""
     if path is None:
         return
@@ -2659,7 +2686,7 @@ void delta_stats_report(void);
 void delta_stats_reset(void);
 """)
 
-def write_common_impl(path: "str | Path | None", packets: typing.Sequence[Packet]):
+def write_common_impl(path: "str | Path | None", packets: typing.Iterable[Packet]):
     """Write contents for common/packets_gen.c to the given path"""
     if path is None:
         return
@@ -2930,7 +2957,8 @@ def main(raw_args: "typing.Sequence[str] | None" = None):
     input_path = src_dir / "networking" / "packets.def"
 
     def_text = read_text(input_path, allow_missing = False)
-    packets = list(parse_packets_def(def_text))
+    packets = PacketsDefinition()
+    packets.parse_text(def_text)
     ### parsing finished
 
     write_common_header(script_args.common_header_path, packets)
