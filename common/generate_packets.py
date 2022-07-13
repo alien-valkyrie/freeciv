@@ -2330,19 +2330,19 @@ class PacketsDefinition(typing.Iterable[Packet]):
     def __iter__(self) -> typing.Iterator[Packet]:
         return iter(self.packets)
 
+    @property
+    def all_caps(self) -> "set[str]":
+        """Set of all capabilities affecting the defined packets"""
+        return set().union(*(p.all_caps for p in self))
 
-def all_caps_union(packets: typing.Iterable[Packet]) -> "set[str]":
-    """Return a set of all capabilities affecting the given packets"""
-    return set().union(*(p.all_caps for p in packets))
 
 # Returns a code fragment which is the implementation of the
 # packet_functional_capability string.
-def get_packet_functional_capability(packets: typing.Iterable[Packet]) -> str:
-    all_caps = all_caps_union(packets)
+def get_packet_functional_capability(packets: PacketsDefinition) -> str:
     return """\
 
 const char *const packet_functional_capability = "%s";
-""" % " ".join(sorted(all_caps))
+""" % " ".join(sorted(packets.all_caps))
 
 # Returns a code fragment which is the implementation of the
 # delta_stats_report() function.
@@ -2462,13 +2462,12 @@ bool packet_has_game_info_flag(enum packet_type type)
 
 # Returns a code fragment which is the implementation of the
 # packet_handlers_fill_initial() function.
-def get_packet_handlers_fill_initial(packets: typing.Iterable[Packet]) -> str:
+def get_packet_handlers_fill_initial(packets: PacketsDefinition) -> str:
     intro = """\
 void packet_handlers_fill_initial(struct packet_handlers *phandlers)
 {
 """
-    all_caps = all_caps_union(packets)
-    for cap in sorted(all_caps):
+    for cap in sorted(packets.all_caps):
         intro += """\
   fc_assert_msg(has_capability("{0}", our_capability),
                 "Packets have support for unknown '{0}' capability!");
@@ -2686,7 +2685,7 @@ void delta_stats_report(void);
 void delta_stats_reset(void);
 """)
 
-def write_common_impl(path: "str | Path | None", packets: typing.Iterable[Packet]):
+def write_common_impl(path: "str | Path | None", packets: PacketsDefinition):
     """Write contents for common/packets_gen.c to the given path"""
     if path is None:
         return
