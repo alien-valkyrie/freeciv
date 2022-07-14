@@ -2617,47 +2617,38 @@ void packet_handlers_fill_capability(struct packet_handlers *phandlers,
 """
         return intro + body + extro
 
-# Returns a code fragment which is the declartion of
-# "enum packet_type".
-def get_enum_packet(packets: typing.Iterable[Packet]) -> str:
-    intro = """\
+    @property
+    def code_enum_packet_type(self) -> str:
+        """Code fragment declaring the packet_type enum"""
+        intro = """\
 enum packet_type {
 """
 
-    mapping={}
-    for p in packets:
-        if p.type_number in mapping:
-            num = p.type_number
-            other = mapping[num]
-            raise ValueError("Duplicate packet ID %d: %s and %s" % (num, other.name, p.name))
-        mapping[p.type_number]=p
+        last = -1
+        body = ""
+        for n, packet in sorted(self.packets_by_number.items()):
+            if n != last + 1:
+                line = "  %s = %d," % (packet.type,n)
+            else:
+                line = "  %s," % (packet.type)
 
-    last=-1
-    body=""
-    for i in sorted(mapping.keys()):
-        p=mapping[i]
-        if i!=last+1:
-            line="  %s = %d,"%(p.type,i)
-        else:
-            line="  %s,"%(p.type)
+            if not (n % 10):
+                line = "%-40s /* %d */" % (line, n)
+            body += line + "\n"
 
-        if (i%10)==0:
-            line="%-40s /* %d */"%(line,i)
-        body=body+line+"\n"
-
-        last=i
-    extro = """\
+            last = n
+        extro = """\
 
   PACKET_LAST  /* leave this last */
 };
 
 """
-    return intro+body+extro
+        return intro+body+extro
 
 
 ########################### Writing output files ###########################
 
-def write_common_header(path: "str | Path | None", packets: typing.Iterable[Packet]):
+def write_common_header(path: "str | Path | None", packets: PacketsDefinition):
     """Write contents for common/packets_gen.h to the given path"""
     if path is None:
         return
@@ -2678,7 +2669,7 @@ def write_common_header(path: "str | Path | None", packets: typing.Iterable[Pack
         for p in packets:
             output_h.write(p.get_struct())
 
-        output_h.write(get_enum_packet(packets))
+        output_h.write(packets.code_enum_packet_type)
 
         # write function prototypes
         for p in packets:
