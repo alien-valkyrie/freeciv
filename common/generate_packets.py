@@ -2342,6 +2342,20 @@ class PacketsDefinition(typing.Iterable[Packet]):
     def __iter__(self) -> typing.Iterator[Packet]:
         return iter(self.packets)
 
+    def iter_by_number(self) -> "typing.Generator[tuple[int, Packet, int], None, int]":
+        """Yield (number, packet, skipped) tuples in order of packet number.
+
+        skipped is how many numbers were skipped since the last packet
+
+        Return the maximum packet number (or -1 if there are no packets)
+        when used with `yield from`."""
+        last = -1
+        for n, packet in sorted(self.packets_by_number.items()):
+            assert n == packet.type_number
+            yield (n, packet, n - last - 1)
+            last = n
+        return last
+
     @property
     def all_caps(self) -> "set[str]":
         """Set of all capabilities affecting the defined packets"""
@@ -2403,16 +2417,14 @@ const char *packet_name(enum packet_type type)
   static const char *const names[PACKET_LAST] = {
 """
 
-        last = -1
         body = ""
-        for n, packet in sorted(self.packets_by_number.items()):
+        for _, packet, skipped in self.iter_by_number():
             body += """\
     "unknown",
-""" * (n - last - 1)
+""" * skipped
             body += """\
     "{packet.type}",
 """.format(packet = packet)
-            last = n
 
         extro = """\
   };
@@ -2433,12 +2445,11 @@ bool packet_has_game_info_flag(enum packet_type type)
   static const bool flag[PACKET_LAST] = {
 """
 
-        last = -1
         body = ""
-        for n, packet in sorted(self.packets_by_number.items()):
+        for _, packet, skipped in self.iter_by_number():
             body += """\
     FALSE,
-""" * (n - last - 1)
+""" * skipped
             if packet.is_info != "game":
                 body += """\
     FALSE, /* {packet.type} */
@@ -2447,7 +2458,6 @@ bool packet_has_game_info_flag(enum packet_type type)
                 body += """\
     TRUE, /* {packet.type} */
 """.format(packet = packet)
-            last = n
 
         extro = """\
   };
@@ -2624,11 +2634,10 @@ void packet_handlers_fill_capability(struct packet_handlers *phandlers,
 enum packet_type {
 """
 
-        last = -1
         body = ""
-        for n, packet in sorted(self.packets_by_number.items()):
-            if n != last + 1:
-                line = "  %s = %d," % (packet.type,n)
+        for n, packet, skipped in self.iter_by_number():
+            if skipped:
+                line = "  %s = %d," % (packet.type, n)
             else:
                 line = "  %s," % (packet.type)
 
@@ -2636,7 +2645,6 @@ enum packet_type {
                 line = "%-40s /* %d */" % (line, n)
             body += line + "\n"
 
-            last = n
         extro = """\
 
   PACKET_LAST  /* leave this last */
