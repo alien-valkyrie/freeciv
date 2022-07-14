@@ -2382,39 +2382,34 @@ void delta_stats_reset(void) {{
 
 """.format(body = body)
 
-# Returns a code fragment which is the implementation of the
-# packet_name() function.
-def get_packet_name(packets: typing.Iterable[Packet]) -> str:
-    intro = """\
+    @property
+    def code_packet_name(self) -> str:
+        """Code fragment implementing the packet_name() function"""
+        intro = """\
 const char *packet_name(enum packet_type type)
 {
   static const char *const names[PACKET_LAST] = {
 """
 
-    mapping = {
-        packet.type_number: packet
-        for packet in packets
-    }
-
-    last=-1
-    body=""
-    for n in sorted(mapping.keys()):
-        body += """\
+        last = -1
+        body = ""
+        for n, packet in sorted(self.packets_by_number.items()):
+            body += """\
     "unknown",
 """ * (n - last - 1)
-        body += """\
-    "%s",
-""" % mapping[n].type
-        last=n
+            body += """\
+    "{packet.type}",
+""".format(packet = packet)
+            last = n
 
-    extro = """\
+        extro = """\
   };
 
   return (type < PACKET_LAST ? names[type] : "unknown");
 }
 
 """
-    return intro+body+extro
+        return intro + body + extro
 
 # Returns a code fragment which is the implementation of the
 # packet_has_game_info_flag() function.
@@ -2737,7 +2732,7 @@ static int stats_total_sent;
         output_c.write(packets.code_delta_stats_report)
         output_c.write(packets.code_delta_stats_reset)
 
-        output_c.write(get_packet_name(packets))
+        output_c.write(packets.code_packet_name)
         output_c.write(get_packet_has_game_info_flag(packets))
 
         # write hash, cmp, send, receive
