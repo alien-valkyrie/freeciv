@@ -2343,27 +2343,25 @@ class PacketsDefinition(typing.Iterable[Packet]):
 const char *const packet_functional_capability = "%s";
 """ % " ".join(sorted(self.all_caps))
 
-# Returns a code fragment which is the implementation of the
-# delta_stats_report() function.
-def get_report(packets: typing.Iterable[Packet]) -> str:
-    if not generate_stats: return """\
+    @property
+    def code_delta_stats_report(self) -> str:
+        """Code fragment implementing the delta_stats_report() function"""
+        if not generate_stats: return """\
 void delta_stats_report(void) {}
 
 """
 
-    intro = """\
-void delta_stats_report(void) {
+        body = "".join(
+            prefix("  ", packet.get_report_part())
+            for packet in self
+        )
+        return """\
+void delta_stats_report(void) {{
   int i;
-"""
-    extro = """\
-}
+{body}\
+}}
 
-"""
-    body = "".join(
-        prefix("  ", packet.get_report_part())
-        for packet in packets
-    )
-    return intro+body+extro
+""".format(body = body)
 
 # Returns a code fragment which is the implementation of the
 # delta_stats_reset() function.
@@ -2738,7 +2736,7 @@ static int stats_total_sent;
             for p in packets:
                 output_c.write(p.get_stats())
             # write report()
-        output_c.write(get_report(packets))
+        output_c.write(packets.code_delta_stats_report)
         output_c.write(get_reset(packets))
 
         output_c.write(get_packet_name(packets))
