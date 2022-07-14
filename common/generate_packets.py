@@ -2270,6 +2270,10 @@ class PacketsDefinition(typing.Iterable[Packet]):
         self.packets_by_number = {}
         self.packets_by_type = {}
 
+        self.sc_packets = []
+        self.cs_packets = []
+        self.unrestricted_packets = []
+
     def parse_text(self, def_text: str):
         """Parse the given text as contents of a packets.def file"""
         self.parse_lines(self.packets_def_lines(def_text))
@@ -2323,6 +2327,14 @@ class PacketsDefinition(typing.Iterable[Packet]):
                 self.packets.append(packet)
                 self.packets_by_number[packet_number] = packet
                 self.packets_by_type[packet_type] = packet
+
+                if packet.dirs == {"sc"}:
+                    self.sc_packets.append(packet)
+                elif packet.dirs == {"cs"}:
+                    self.cs_packets.append(packet)
+                else:
+                    self.unrestricted_packets.append(packet)
+
                 continue
 
             raise ValueError("Unexpected line: " + line)
@@ -2446,61 +2458,61 @@ bool packet_has_game_info_flag(enum packet_type type)
 """
         return intro + body + extro
 
-# Returns a code fragment which is the implementation of the
-# packet_handlers_fill_initial() function.
-def get_packet_handlers_fill_initial(packets: PacketsDefinition) -> str:
-    intro = """\
+    @property
+    def code_packet_handlers_fill_initial(self) -> str:
+        """Code fragment implementing the packet_handlers_fill_initial()
+        function"""
+        intro = """\
 void packet_handlers_fill_initial(struct packet_handlers *phandlers)
 {
 """
-    for cap in sorted(packets.all_caps):
-        intro += """\
+        for cap in sorted(self.all_caps):
+            intro += """\
   fc_assert_msg(has_capability("{0}", our_capability),
                 "Packets have support for unknown '{0}' capability!");
 """.format(cap)
 
-    sc_packets=[]
-    cs_packets=[]
-    unrestricted=[]
-    for p in packets:
-        if len(p.variants)==1:
-            # Packets with variants are correctly handled in
-            # packet_handlers_fill_capability(). They may remain without
-            # handler at connecting time, because it would be anyway wrong
-            # to use them before the network capability string would be
-            # known.
-            if p.dirs == {"sc"}:
-                sc_packets.append(p)
-            elif p.dirs == {"cs"}:
-                cs_packets.append(p)
-            else:
-                unrestricted.append(p)
+        sc = [
+            p.variants[0]
+            for p in self.sc_packets
+            if len(p.variants) == 1
+        ]
+        cs = [
+            p.variants[0]
+            for p in self.cs_packets
+            if len(p.variants) == 1
+        ]
+        unrestricted = [
+            p.variants[0]
+            for p in self.unrestricted_packets
+            if len(p.variants) == 1
+        ]
 
-    body=""
-    for p in unrestricted:
-        body += prefix("  ", p.variants[0].send_handler)
-        body += prefix("  ", p.variants[0].receive_handler)
-    body += """\
+        body = ""
+        for v in unrestricted:
+            body += prefix("  ", v.send_handler)
+            body += prefix("  ", v.receive_handler)
+        body += """\
   if (is_server()) {
 """
-    for p in sc_packets:
-        body += prefix("    ", p.variants[0].send_handler)
-    for p in cs_packets:
-        body += prefix("    ", p.variants[0].receive_handler)
-    body += """\
+        for v in sc:
+            body += prefix("    ", v.send_handler)
+        for v in cs:
+            body += prefix("    ", v.receive_handler)
+        body += """\
   } else {
 """
-    for p in cs_packets:
-        body += prefix("    ", p.variants[0].send_handler)
-    for p in sc_packets:
-        body += prefix("    ", p.variants[0].receive_handler)
+        for v in cs:
+            body += prefix("    ", v.send_handler)
+        for v in sc:
+            body += prefix("    ", v.receive_handler)
 
-    extro = """\
+        extro = """\
   }
 }
 
 """
-    return intro+body+extro
+        return intro + body + extro
 
 # Returns a code fragment which is the implementation of the
 # packet_handlers_fill_capability() function.
@@ -2739,7 +2751,7 @@ static int stats_total_sent;
             output_c.write(p.get_dsend())
             output_c.write(p.get_dlsend())
 
-        output_c.write(get_packet_handlers_fill_initial(packets))
+        output_c.write(packets.code_packet_handlers_fill_initial)
         output_c.write(get_packet_handlers_fill_capability(packets))
 
 def write_server_header(path: "str | Path | None", packets: typing.Iterable[Packet]):
