@@ -393,19 +393,10 @@ class SizeInfo:
         return "%s:%s" % (self.declared, self._actual)
 
 
-class Field:
-    """A single field of a packet. Consists of a name, type information
-    (including array sizes) and flags."""
+class FieldType:
+    """Type information for a field"""
 
-    FIELDS_LINE_PATTERN = re.compile(r"^\s*(\S+(?:\(.*\))?)\s+([^;()]*)\s*;\s*(.*)\s*$")
-    """Matches an entire field definition line.
-
-    Groups:
-    - type
-    - field names and array sizes
-    - flags"""
-
-    TYPE_INFO_PATTERN = re.compile(r"^(.*)\((.*)\)$")
+    TYPE_INFO_PATTERN = re.compile(r"^([^()]*)\((.*)\)$")
     """Matches a field type.
 
     Groups:
@@ -419,6 +410,41 @@ class Field:
     - non-numeric dataio type
     - numeric float factor"""
 
+    @classmethod
+    def parse(cls, type_text: str) -> "FieldType":
+        """Parse a single field type"""
+        mo = cls.TYPE_INFO_PATTERN.fullmatch(type_text)
+        if mo is None:
+            raise ValueError("malformed type or undefined alias: %r" % type_text)
+        dataio_type, public_type = mo.groups("")
+
+        if public_type != "float":
+            return cls(dataio_type, public_type)
+
+        mo = cls.FLOAT_FACTOR_PATTERN.fullmatch(dataio_type)
+        if mo is None:
+            raise ValueError("float type without float factor: %r" % type_text)
+        dataio_type, float_factor = mo.groups("")
+        return cls(dataio_type, public_type, int(float_factor))
+
+    def __init__(self, dataio_type: str, public_type: str, float_factor: int = -1):
+        self.dataio_type = dataio_type
+        self.public_type = public_type
+        self.float_factor = float_factor
+
+
+class Field:
+    """A single field of a packet. Consists of a name, type information
+    (including array sizes) and flags."""
+
+    FIELDS_LINE_PATTERN = re.compile(r"^\s*(\S+(?:\(.*\))?)\s+([^;()]*)\s*;\s*(.*)\s*$")
+    """Matches an entire field definition line.
+
+    Groups:
+    - type
+    - field names and array sizes
+    - flags"""
+
     FIELD_ARRAY_PATTERN = re.compile(r"^(.+)\[([^][]+)\]$")
     """Matches a field definition with one or more array sizes
 
@@ -427,7 +453,7 @@ class Field:
     - the final array size"""
 
     @classmethod
-    def parse(cls, line: str, resolve_type: typing.Callable[[str], str]) -> "typing.Iterable[Field]":
+    def parse(cls, line: str, resolve_type: typing.Callable[[str], FieldType]) -> "typing.Iterable[Field]":
         """Parse a single line defining one or more fields"""
         mo = cls.FIELDS_LINE_PATTERN.fullmatch(line)
         if mo is None:
@@ -435,20 +461,7 @@ class Field:
         type_text, fields, flags = (i.strip() for i in mo.groups(""))
 
         # analyze type
-        type_text = resolve_type(type_text)
-
-        type_info = {}
-        mo = cls.TYPE_INFO_PATTERN.fullmatch(type_text)
-        if mo is None:
-            raise ValueError("malformed or undefined type: %r" % type_text)
-        type_info["dataio_type"], type_info["struct_type"] = mo.groups()
-
-        if type_info["struct_type"] == "float":
-            mo = cls.FLOAT_FACTOR_PATTERN.fullmatch(type_info["dataio_type"])
-            if mo is None:
-                raise ValueError("float type without float factor: %r" % type_text)
-            type_info["dataio_type"] = mo.group(1)
-            type_info["float_factor"] = int(mo.group(2))
+        type_info = resolve_type(type_text)
 
         # analyze flags
         flag_info = FieldFlags.parse(flags)
@@ -465,7 +478,7 @@ class Field:
                 mo = cls.FIELD_ARRAY_PATTERN.fullmatch(field_text)
             yield Field(field_text, type_info, sizes, flag_info)
 
-    def __init__(self, name: str, typeinfo: typing.Mapping,
+    def __init__(self, name: str, type_info: FieldType,
                        sizes: typing.Iterable[SizeInfo], flags: FieldFlags):
         self.name = name
         """Field name"""
@@ -475,11 +488,24 @@ class Field:
         if self.dimensions > 2:
             raise ValueError("Too many array dimensions for field %s" % name)
 
-        self.dataio_type = typeinfo["dataio_type"]
-        self.struct_type = typeinfo["struct_type"]
-        self.float_factor = typeinfo.get("float_factor")
-
+        self.type_info = type_info
         self.flags = flags
+
+    @property
+    def dataio_type(self) -> str:
+        """The type this field is transmitted as"""
+        return self.type_info.dataio_type
+
+    @property
+    def struct_type(self) -> str:
+        """The public type for this field used in the packet struct"""
+        return self.type_info.public_type
+
+    @property
+    def float_factor(self) -> int:
+        """The granularity for transmitting this field. Meaningless for
+        non-float fields."""
+        return self.type_info.float_factor
 
     @property
     def is_struct(self) -> bool:
@@ -1911,7 +1937,7 @@ class Packet:
     want_force = False
 
     def __init__(self, packet_type: str, packet_number: int, flags_text: str,
-                       lines: typing.Iterable[str], resolve_type: typing.Callable[[str], str]):
+                       lines: typing.Iterable[str], resolve_type: typing.Callable[[str], FieldType]):
         self.type = packet_type
         self.type_number = packet_number
 
@@ -2283,21 +2309,13 @@ class PacketsDefinition(typing.Iterable[Packet]):
                 raise ValueError("duplicate type alias %r: %r and %r"
                                     % (alias, old_meaning, meaning))
 
-        # short-circuit
-        meaning = self.resolve_type(meaning)
+        self.types[alias] = self.resolve_type(meaning)
 
-        # avoid infinite loops
-        if meaning == alias:
-            raise ValueError("cyclic type aliases: %r resolves to itself" % alias)
-
-        self.types[alias] = meaning
-
-    def resolve_type(self, type_text: str) -> str:
+    def resolve_type(self, type_text: str) -> FieldType:
         """Resolve the given type"""
-        # no infinite loop possible due to checks in define_type()
-        while type_text in self.types:
-            type_text = self.types[type_text]
-        return type_text
+        if type_text not in self.types:
+            self.types[type_text] = FieldType.parse(type_text)
+        return self.types[type_text]
 
     def parse_text(self, def_text: str):
         """Parse the given text as contents of a packets.def file"""
