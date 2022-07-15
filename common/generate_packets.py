@@ -2274,6 +2274,18 @@ class PacketsDefinition(typing.Iterable[Packet]):
         self.cs_packets = []
         self.unrestricted_packets = []
 
+    def define_type(self, alias: str, meaning: str):
+        """Define a type alias"""
+        if alias in self.types:
+            old_meaning = self.types[alias]
+            if meaning == old_meaning:
+                verbose("duplicate typedef: %r = %r" % (alias, meaning))
+                return
+            else:
+                raise ValueError("duplicate type alias %r: %r and %r"
+                                    % (alias, old_meaning, meaning))
+        self.types[alias] = meaning
+
     def parse_text(self, def_text: str):
         """Parse the given text as contents of a packets.def file"""
         self.parse_lines(self.packets_def_lines(def_text))
@@ -2286,15 +2298,7 @@ class PacketsDefinition(typing.Iterable[Packet]):
             mo = self.TYPE_PATTERN.fullmatch(line)
             if mo is not None:
                 # type definition line
-                alias, dest = mo.groups("")
-                if alias in self.types:
-                    if dest == self.types[alias]:
-                        verbose("duplicate typedef: %r = %r" % (alias, dest))
-                        continue
-                    else:
-                        raise ValueError("duplicate type alias %r: %r and %r"
-                                            % (alias, self.types[alias], dest))
-                self.types[alias] = dest
+                self.define_type(*mo.groups())
                 continue
 
             mo = self.PACKET_HEADER_PATTERN.fullmatch(line)
