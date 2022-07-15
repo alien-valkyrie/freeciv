@@ -2282,11 +2282,19 @@ class PacketsDefinition(typing.Iterable[Packet]):
             else:
                 raise ValueError("duplicate type alias %r: %r and %r"
                                     % (alias, old_meaning, meaning))
+
+        # short-circuit
+        meaning = self.resolve_type(meaning)
+
+        # avoid infinite loops
+        if meaning == alias:
+            raise ValueError("cyclic type aliases: %r resolves to itself" % alias)
+
         self.types[alias] = meaning
 
     def resolve_type(self, type_text: str) -> str:
         """Resolve the given type"""
-        # FIXME: no infinite loop detection
+        # no infinite loop possible due to checks in define_type()
         while type_text in self.types:
             type_text = self.types[type_text]
         return type_text
