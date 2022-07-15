@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from functools import partial
 from itertools import chain, combinations, takewhile
 from collections import deque
+import weakref
 
 try:
     from functools import cache
@@ -1246,7 +1247,7 @@ class Variant:
         self.gen_stats=generate_stats
         self.gen_log=generate_logs
 
-        self.packet = packet
+        self._packet = weakref.ref(packet)
         self.no=no
         self.name = "%s_%d" % (packet.name, no)
 
@@ -1266,6 +1267,15 @@ class Variant:
 
         if not self.fields and packet.fields:
             raise ValueError("empty variant for nonempty {self.packet_name} with capabilities {self.poscaps}".format(self = self))
+
+    @property
+    def packet(self) -> "Packet":
+        """The packet this is a variant of"""
+        packet = self._packet()
+        if not packet:
+            # variants aren't supposed to stick around after their packet is gone
+            raise ValueError("Variant used after Packet no longer exists")
+        return packet
 
     @property
     def packet_name(self) -> str:
