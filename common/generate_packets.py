@@ -427,7 +427,7 @@ class Field:
     - the final array size"""
 
     @classmethod
-    def parse(cls, line: str, types: typing.Mapping[str, str]) -> "typing.Iterable[Field]":
+    def parse(cls, line: str, resolve_type: typing.Callable[[str], str]) -> "typing.Iterable[Field]":
         """Parse a single line defining one or more fields"""
         mo = cls.FIELDS_LINE_PATTERN.fullmatch(line)
         if mo is None:
@@ -435,9 +435,7 @@ class Field:
         type_text, fields, flags = (i.strip() for i in mo.groups(""))
 
         # analyze type
-        # FIXME: no infinite loop detection
-        while type_text in types:
-            type_text = types[type_text]
+        type_text = resolve_type(type_text)
 
         type_info = {}
         mo = cls.TYPE_INFO_PATTERN.fullmatch(type_text)
@@ -1913,7 +1911,7 @@ class Packet:
     want_force = False
 
     def __init__(self, packet_type: str, packet_number: int, flags_text: str,
-                       lines: typing.Iterable[str], types: typing.Mapping[str, str]):
+                       lines: typing.Iterable[str], resolve_type: typing.Callable[[str], str]):
         self.type = packet_type
         self.type_number = packet_number
 
@@ -1982,7 +1980,7 @@ class Packet:
         self.fields = [
             field
             for line in lines
-            for field in Field.parse(line, types)
+            for field in Field.parse(line, resolve_type)
         ]
         self.key_fields = [field for field in self.fields if field.is_key]
         self.other_fields = [field for field in self.fields if not field.is_key]
@@ -2286,6 +2284,13 @@ class PacketsDefinition(typing.Iterable[Packet]):
                                     % (alias, old_meaning, meaning))
         self.types[alias] = meaning
 
+    def resolve_type(self, type_text: str) -> str:
+        """Resolve the given type"""
+        # FIXME: no infinite loop detection
+        while type_text in self.types:
+            type_text = self.types[type_text]
+        return type_text
+
     def parse_text(self, def_text: str):
         """Parse the given text as contents of a packets.def file"""
         self.parse_lines(self.packets_def_lines(def_text))
@@ -2326,7 +2331,7 @@ class PacketsDefinition(typing.Iterable[Packet]):
                         lambda line: self.PACKET_END_PATTERN.fullmatch(line) is None,
                         lines_iter, # advance the iterator used by this for-loop
                     ),
-                    self.types,
+                    self.resolve_type,
                 )
                 self.packets.append(packet)
                 self.packets_by_number[packet_number] = packet
