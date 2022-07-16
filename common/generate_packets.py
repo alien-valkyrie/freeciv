@@ -24,6 +24,7 @@ from functools import partial
 from itertools import chain, combinations, takewhile
 from collections import deque
 import weakref
+from enum import Enum
 
 try:
     from functools import cache
@@ -1931,6 +1932,33 @@ if (NULL != *hash) {
 #endif /* FREECIV_DELTA_PROTOCOL */
 """
 
+
+class Directions(Enum):
+    """Describes the possible combinations of directions for which a packet
+    can be valid"""
+
+    # Note: "sc" and "cs" are used to match the packet flags
+
+    DOWN_ONLY = frozenset({"sc"})
+    """Packet may only be sent from server to client"""
+
+    UP_ONLY = frozenset({"cs"})
+    """Packet may only be sent from client to server"""
+
+    UNRESTRICTED = frozenset({"sc", "cs"})
+    """Packet may be sent both ways"""
+
+    @property
+    def down(self) -> bool:
+        """Whether a packet may be sent from server to client"""
+        return "sc" in self.value
+
+    @property
+    def up(self) -> bool:
+        """Whether a packet may be sent from client to server"""
+        return "cs" in self.value
+
+
 # Class which represents a packet. A packet contains a list of fields.
 class Packet:
     # matches a packet cancel flag (cancelled packet type)
@@ -1966,12 +1994,12 @@ class Packet:
             if stripped
         }
 
-        self.dirs = set()
+        directions = set()
         self.cancel = set()
 
         for flag in flag_texts:
             if flag in ("sc", "cs"):
-                self.dirs.add(flag)
+                directions.add(flag)
                 continue
             if flag == "is-info":
                 self.is_info = "yes"
@@ -2018,8 +2046,9 @@ class Packet:
 
             raise ValueError("Unrecognized flag: " + flag)
 
-        if not self.dirs:
+        if not directions:
             raise ValueError("no directions defined for %s" % self.name)
+        self.dirs = Directions(directions)
 
         self.fields = [
             field
@@ -2311,10 +2340,19 @@ class PacketsDefinition(typing.Iterable[Packet]):
         self.packets = []
         self.packets_by_number = {}
         self.packets_by_type = {}
+        self.packets_by_dirs = { dirs: [] for dirs in Directions }
 
-        self.sc_packets = []
-        self.cs_packets = []
-        self.unrestricted_packets = []
+    @property
+    def down_packets(self) -> "list[Packet]":
+        return self.packets_by_dirs[Directions.DOWN_ONLY];
+
+    @property
+    def up_packets(self) -> "list[Packet]":
+        return self.packets_by_dirs[Directions.UP_ONLY];
+
+    @property
+    def unrestricted_packets(self) -> "list[Packet]":
+        return self.packets_by_dirs[Directions.UNRESTRICTED];
 
     def define_type(self, alias: str, meaning: str):
         """Define a type alias"""
@@ -2380,13 +2418,7 @@ class PacketsDefinition(typing.Iterable[Packet]):
                 self.packets.append(packet)
                 self.packets_by_number[packet_number] = packet
                 self.packets_by_type[packet_type] = packet
-
-                if packet.dirs == {"sc"}:
-                    self.sc_packets.append(packet)
-                elif packet.dirs == {"cs"}:
-                    self.cs_packets.append(packet)
-                else:
-                    self.unrestricted_packets.append(packet)
+                self.packets_by_dirs[packet.dirs].append(packet)
 
                 continue
 
@@ -2537,12 +2569,12 @@ void packet_handlers_fill_initial(struct packet_handlers *phandlers)
 
         sc = [
             p.variants[0]
-            for p in self.sc_packets
+            for p in self.down_packets
             if len(p.variants) == 1
         ]
         cs = [
             p.variants[0]
-            for p in self.cs_packets
+            for p in self.up_packets
             if len(p.variants) == 1
         ]
         unrestricted = [
@@ -2589,12 +2621,12 @@ void packet_handlers_fill_capability(struct packet_handlers *phandlers,
 
         sc_packets = [
             p
-            for p in self.sc_packets
+            for p in self.down_packets
             if len(p.variants) > 1
         ]
         cs_packets = [
             p
-            for p in self.cs_packets
+            for p in self.up_packets
             if len(p.variants) > 1
         ]
         unrestricted = [
@@ -2832,7 +2864,7 @@ bool server_handle_packet(enum packet_type type, const void *packet,
 """)
 
         for p in packets:
-            if "cs" in p.dirs and not p.no_handle:
+            if p.dirs.up and not p.no_handle:
                 a=p.name[len("packet_"):]
                 b = "".join(
                     ", %s%s" % (field.get_handle_type(), field.name)
@@ -2868,7 +2900,7 @@ bool client_handle_packet(enum packet_type type, const void *packet);
 
 """)
         for p in packets:
-            if "sc" not in p.dirs: continue
+            if not p.dirs.down: continue
 
             a=p.name[len("packet_"):]
             b = ", ".join(
@@ -2906,7 +2938,7 @@ bool server_handle_packet(enum packet_type type, const void *packet,
   switch (type) {
 """)
         for packet in packets:
-            if "cs" not in packet.dirs: continue
+            if not packet.dirs.up: continue
             if packet.no_handle: continue
             name_part = packet.name[len("packet_"):]
 
@@ -2957,7 +2989,7 @@ bool client_handle_packet(enum packet_type type, const void *packet)
   switch (type) {
 """)
         for packet in packets:
-            if "sc" not in packet.dirs: continue
+            if not packet.dirs.down: continue
             if packet.no_handle: continue
             name_part = packet.name[len("packet_"):]
 
