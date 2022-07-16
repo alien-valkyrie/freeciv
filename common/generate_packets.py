@@ -549,6 +549,14 @@ class Field:
             return "const %s *"%self.struct_type
         return self.struct_type+" "
 
+    def get_handle_arg(self, packet: str) -> str:
+        """Return the argument passed to the external handler on each side
+        of the connection"""
+        arg = "{packet}->{self.name}".format(self = self, packet = packet)
+        if self.dataio_type == "worklist":
+            arg = "&" + arg
+        return arg
+
     # Returns code which is used in the declaration of the field in
     # the packet struct.
     def get_declar(self) -> str:
@@ -2897,39 +2905,31 @@ bool server_handle_packet(enum packet_type type, const void *packet,
 {
   switch (type) {
 """)
-        for p in packets:
-            if "cs" not in p.dirs: continue
-            if p.no_handle: continue
-            a=p.name[len("packet_"):]
-            c = "((const struct %s *)packet)->" % p.name
-            b=[]
-            for x in p.fields:
-                y="%s%s"%(c,x.name)
-                if x.dataio_type=="worklist":
-                    y="&"+y
-                b.append(y)
-            b=",\n      ".join(b)
-            if b:
-                b=",\n      "+b
+        for packet in packets:
+            if "cs" not in packet.dirs: continue
+            if packet.no_handle: continue
+            name_part = packet.name[len("packet_"):]
 
-            if p.handle_via_packet:
-                if p.handle_per_conn:
-                    args="pconn, packet"
-                else:
-                    args="pplayer, packet"
-
+            if packet.handle_per_conn:
+                first_arg = "pconn"
             else:
-                if p.handle_per_conn:
-                    args="pconn"+b
-                else:
-                    args="pplayer"+b
+                first_arg = "pplayer"
+
+            if packet.handle_via_packet:
+                args = ", packet"
+            else:
+                cast_packet = "((const struct %s *)packet)" % packet.name
+                args = "".join(
+                    ",\n      " + field.get_handle_arg(cast_packet)
+                    for field in packet.fields
+                )
 
             f.write("""\
   case %s:
-    handle_%s(%s);
+    handle_%s(%s%s);
     return TRUE;
 
-""" % (p.type, a, args))
+""" % (packet.type, name_part, first_arg, args))
         f.write("""\
   default:
     return FALSE;
@@ -2956,32 +2956,26 @@ bool client_handle_packet(enum packet_type type, const void *packet)
 {
   switch (type) {
 """)
-        for p in packets:
-            if "sc" not in p.dirs: continue
-            if p.no_handle: continue
-            a=p.name[len("packet_"):]
-            c = "((const struct %s *)packet)->" % p.name
-            b=[]
-            for x in p.fields:
-                y="%s%s"%(c,x.name)
-                if x.dataio_type=="worklist":
-                    y="&"+y
-                b.append(y)
-            b=",\n      ".join(b)
-            if b:
-                b="\n      "+b
+        for packet in packets:
+            if "sc" not in packet.dirs: continue
+            if packet.no_handle: continue
+            name_part = packet.name[len("packet_"):]
 
-            if p.handle_via_packet:
-                args="packet"
+            if packet.handle_via_packet:
+                args = "packet"
             else:
-                args=b
+                cast_packet = "((const struct %s *)packet)" % packet.name
+                args = ",".join(
+                    "\n      " + field.get_handle_arg(cast_packet)
+                    for field in packet.fields
+                )
 
             f.write("""\
   case %s:
     handle_%s(%s);
     return TRUE;
 
-""" % (p.type, a, args))
+""" % (packet.type, name_part, args))
         f.write("""\
   default:
     return FALSE;
