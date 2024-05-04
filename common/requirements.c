@@ -6272,6 +6272,26 @@ enum fc_tristate tri_req_present(const struct civ_map *nmap,
                                  const struct req_context *other_context,
                                  const struct requirement *req)
 {
+  /* Recursion detection: Maintain a stack of requirements that are
+   * currently being checked, and abort if we see the same req twice.
+   * Note that we're only storing the reqs themselves; we're not making
+   * an exception for the same req being evaluated against multiple
+   * different contexts. */
+  struct recur_node {
+    const struct recur_node *next;
+    const struct requirement *req;
+  };
+  /* The current deepest level of recursion */
+  static const struct recur_node *recur_head = nullptr;
+  /* Stack node representing this call to tri_req_present() */
+  const struct recur_node recur_current = {
+    .next = recur_head,
+    .req = req,
+  };
+  const struct recur_node *recur_i;
+
+  enum fc_tristate result;
+
   if (!context) {
     context = req_context_empty();
   }
@@ -6287,8 +6307,29 @@ enum fc_tristate tri_req_present(const struct civ_map *nmap,
 
   fc_assert_ret_val(req_definitions[req->source.kind].cb != NULL, TRI_NO);
 
-  return req_definitions[req->source.kind].cb(nmap, context,
-                                              other_context, req);
+  for (recur_i = recur_head; recur_i != nullptr; recur_i = recur_i->next) {
+    if (are_requirements_equal(req, recur_i->req)) {
+      /* Infinite recursion! Abort and return TRI_MAYBE. */
+      struct astring astr;
+
+      log_warn("Infinite recursion when evaluating requirement: %s",
+               req_to_fstring(req, &astr));
+      astr_free(&astr);
+
+      return TRI_MAYBE;
+    }
+  }
+
+  /* push */
+  recur_head = &recur_current;
+
+  result = req_definitions[req->source.kind].cb(nmap, context,
+                                                other_context, req);
+
+  /* pop */
+  recur_head = recur_current.next;
+
+  return result;
 }
 
 /**********************************************************************//**
